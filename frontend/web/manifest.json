@@ -1,11 +1,11 @@
 {
-    "name": "ppp_app",
-    "short_name": "ppp_app",
+    "name": "PPP Supply",
+    "short_name": "PPP Supply",
     "start_url": ".",
     "display": "standalone",
     "background_color": "#0175C2",
     "theme_color": "#0175C2",
-    "description": "A new Flutter project.",
+    "description": "Procurement between hospitals and their registered suppliers: medicines, laboratory reagents and consumables.",
     "orientation": "portrait-primary",
     "prefer_related_applications": false,
     "icons": [
