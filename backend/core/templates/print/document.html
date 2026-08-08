@@ -1,0 +1,197 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+{# The tab title is also the browser's default filename for "Save as PDF". #}
+<title>{{ title|title }} {{ reference }}</title>
+<style>
+  /* Tables all the way down, and no flexbox or grid: the same markup is read
+     by a browser and by xhtml2pdf, and xhtml2pdf understands neither. */
+  body {
+    /* Unquoted: xhtml2pdf matches the family name literally. */
+    font-family: {% if pdf_font %}{{ pdf_font }}{% else %}"Segoe UI", Helvetica, Arial, sans-serif{% endif %};
+    font-size: 9.5pt; line-height: 1.4; color: #111;
+  }
+  h1 { margin: 0; font-size: 15pt; letter-spacing: 1px; }
+  .muted { color: #555; }
+  .label { font-size: 7.5pt; color: #666; text-transform: uppercase; letter-spacing: 1px; }
+  table { width: 100%; border-collapse: collapse; }
+  td, th { vertical-align: top; }
+  .right { text-align: right; }
+  .head td { border-bottom: 2px solid #111; padding-bottom: 6px; }
+  .ref { text-align: right; font-size: 12pt; font-weight: bold; }
+  .banner td {
+    background-color: #fbe9e9; color: #a11; border: 1px solid #e0b4b4;
+    padding: 5px 8px; font-weight: bold; margin-top: 6px;
+  }
+  .parties { margin-top: 10px; }
+  .parties td { width: 50%; padding-right: 12px; }
+  .party-name { font-weight: bold; font-size: 10.5pt; }
+  .meta { margin-top: 10px; margin-bottom: 10px; }
+  .meta td { padding: 1px 0; }
+  .meta td.key { color: #666; width: 17%; }
+  .meta td.value { width: 33%; }
+  .lines { margin-bottom: 10px; }
+  .lines th {
+    background-color: #efefef; border-bottom: 1px solid #111; text-align: left;
+    font-size: 7.5pt; text-transform: uppercase; letter-spacing: 1px; padding: 4px 6px;
+  }
+  .lines th.right { text-align: right; }
+  .lines td { border-bottom: 1px solid #ddd; padding: 4px 6px; }
+  .totals td { padding: 2px 6px; }
+  .totals td.amount { text-align: right; }
+  .totals tr.last td { border-top: 1px solid #111; font-weight: bold; }
+  .notes p { margin: 3px 0; }
+  .signatures { margin-top: 30px; }
+  .signatures td { border-top: 1px solid #111; padding-top: 3px; padding-right: 24px; }
+  .foot td { border-top: 1px solid #ddd; padding-top: 4px; font-size: 7.5pt; color: #666; }
+
+{% if pdf %}
+  /* xhtml2pdf: a named content frame plus a static footer frame, which is what
+     puts a page number on every sheet of a ledger that runs long. A4 is
+     21 x 29.7cm; 1.4cm margins leave 18.2cm across. */
+  @page {
+    size: a4 portrait;
+    margin: 1.4cm;
+    @frame content_frame { left: 1.4cm; top: 1.4cm; width: 18.2cm; height: 25.6cm; }
+    @frame footer_frame {
+      -pdf-frame-content: page-footer;
+      left: 1.4cm; top: 27.4cm; width: 18.2cm; height: 1cm;
+    }
+  }
+  #page-footer { font-size: 7.5pt; color: #666; }
+{% else %}
+  body { margin: 0 auto; padding: 18px; max-width: 190mm; background: #fff; }
+  .bar { text-align: right; margin-bottom: 10px; }
+  .bar button {
+    font: inherit; padding: 7px 16px; cursor: pointer; border-radius: 4px;
+    border: 1px solid #111; background: #111; color: #fff;
+  }
+  @media print {
+    body { padding: 0; }
+    .no-print { display: none; }
+    thead { display: table-header-group; }
+    tr { break-inside: avoid; }
+    @page { size: A4; margin: 14mm; }
+  }
+{% endif %}
+</style>
+</head>
+<body>
+
+{% if not pdf %}<div class="bar no-print"><button onclick="window.print()">Print</button></div>{% endif %}
+
+<table class="head">
+  <tr>
+    <td>
+      <h1>{{ title }}</h1>
+      {% if party_from %}<div class="muted">{{ party_from.name }}</div>{% endif %}
+    </td>
+    <td class="ref">
+      <div class="label">{% if party_to %}Reference{% else %}Printed{% endif %}</div>
+      {{ reference }}
+    </td>
+  </tr>
+</table>
+
+{% if banner %}
+<table class="banner"><tr><td>{{ banner }}</td></tr></table>
+{% endif %}
+
+{% if party_from %}
+<table class="parties">
+  <tr>
+    <td>
+      <div class="label">{{ from_label }}</div>
+      <div class="party-name">{{ party_from.name }}</div>
+      {% if party_from.address %}<div>{{ party_from.address }}</div>{% endif %}
+      <div class="muted">{{ party_from.phone }}{% if party_from.email %} · {{ party_from.email }}{% endif %}</div>
+      {% if party_from.registration_no %}<div class="muted">RC {{ party_from.registration_no }}</div>{% endif %}
+    </td>
+    <td>
+      {% if party_to %}
+      <div class="label">{{ to_label }}</div>
+      <div class="party-name">{{ party_to.name }}</div>
+      {% if party_to.address %}<div>{{ party_to.address }}</div>{% endif %}
+      <div class="muted">{{ party_to.phone }}{% if party_to.email %} · {{ party_to.email }}{% endif %}</div>
+      {% if party_to.registration_no %}<div class="muted">RC {{ party_to.registration_no }}</div>{% endif %}
+      {% endif %}
+    </td>
+  </tr>
+</table>
+{% endif %}
+
+<table class="meta">
+  {% for pair in meta_rows %}
+  <tr>
+    {% for label, value in pair %}<td class="key">{{ label }}</td><td class="value">{{ value }}</td>{% endfor %}
+  </tr>
+  {% endfor %}
+</table>
+
+{% if columns %}
+{% comment %}
+repeat="1": xhtml2pdf carries the header row onto every page of a long
+ledger. A browser does the same from `thead { display: table-header-group }`
+and ignores the attribute.
+{% endcomment %}
+<table class="lines" repeat="1">
+  <thead>
+    <tr>{% for label, align in columns %}<th class="{{ align }}">{{ label }}</th>{% endfor %}</tr>
+  </thead>
+  <tbody>
+    {% for row in rows %}
+    <tr>{% for cell, align in row %}<td class="{{ align }}">{{ cell }}</td>{% endfor %}</tr>
+    {% empty %}
+    <tr><td colspan="{{ columns|length }}" class="muted">Nothing on this document.</td></tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+
+{% if totals %}
+<table>
+  <tr>
+    <td></td>
+    <td width="42%">
+      <table class="totals">
+        {% for label, value in totals %}
+        <tr {% if forloop.last %}class="last"{% endif %}><td>{{ label }}</td><td class="amount">{{ value }}</td></tr>
+        {% endfor %}
+      </table>
+    </td>
+  </tr>
+</table>
+{% endif %}
+
+<div class="notes">
+  {% for label, text in notes %}{% if text %}<p><span class="label">{{ label }}:</span> {{ text }}</p>{% endif %}{% endfor %}
+</div>
+
+<table class="signatures">
+  <tr>{% for caption in signatures %}<td class="label">{{ caption }} — name, signature, date</td>{% endfor %}</tr>
+</table>
+
+<table class="foot">
+  <tr>
+    <td>Printed by {{ printed_by }} on {{ printed_at }}</td>
+    <td class="right">{{ title|title }} {{ reference }}</td>
+  </tr>
+</table>
+
+{% if pdf %}
+<div id="page-footer">
+  {{ title|title }} {{ reference }} · printed by {{ printed_by }} on {{ printed_at }}
+  · page <pdf:pagenumber /> of <pdf:pagecount />
+</div>
+{% else %}
+<script>
+  // Straight to the print dialog: this page exists for nothing else. Cancelling
+  // it leaves the document on screen to read.
+  window.addEventListener('load', function () { window.print(); });
+</script>
+{% endif %}
+
+</body>
+</html>
