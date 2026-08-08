@@ -135,6 +135,7 @@ USE_TZ = True
 # https://docs.djangoproject.com/en/6.1/howto/static-files/
 
 STATIC_URL = 'static/'
+STATIC_ROOT = BASE_DIR / 'staticfiles'
 
 # Uploaded payment receipts. Django serves these itself only while DEBUG is on
 # (see config/urls.py); behind a real server, hand /media/ to it.
