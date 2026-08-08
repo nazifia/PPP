@@ -1762,3 +1762,128 @@ class SupplyFlowTests(APITestCase):
 
         self.login('08011111111')
         self.assertEqual(self.client.get('/api/audit-logs/print/').status_code, 200)
+
+    def test_an_organisation_cannot_be_left_without_an_administrator(self):
+        self.login('08011111111')
+
+        # The only administrator can neither step down nor be disabled.
+        for payload in ({'role': Role.STAFF}, {'is_active': False}):
+            response = self.client.patch(
+                f'/api/users/{self.hospital_admin.id}/', payload, format='json',
+            )
+            self.assertEqual(response.status_code, 400, response.data)
+        self.hospital_admin.refresh_from_db()
+        self.assertEqual(self.hospital_admin.role, Role.ADMIN)
+        self.assertTrue(self.hospital_admin.is_active)
+
+        # With a second administrator in place, the first may step down.
+        deputy = User.objects.create_user(
+            phone='08055555555', password='Sup3rSecret!', full_name='Deputy',
+            organization=self.hospital, role=Role.ADMIN,
+        )
+        self.assertEqual(
+            self.client.patch(
+                f'/api/users/{self.hospital_admin.id}/', {'role': Role.STAFF}, format='json',
+            ).status_code,
+            200,
+        )
+
+        # And now the deputy is the last one standing, so DELETE refuses too.
+        self.login(deputy.phone)
+        self.assertEqual(self.client.delete(f'/api/users/{deputy.id}/').status_code, 400)
+
+    def test_a_disabled_account_is_enabled_again_by_an_administrator(self):
+        staff = User.objects.create_user(
+            phone='08066666666', password='Sup3rSecret!', full_name='Ward Clerk',
+            organization=self.hospital, role=Role.STAFF,
+        )
+        self.login('08011111111')
+        self.assertEqual(self.client.delete(f'/api/users/{staff.id}/').status_code, 204)
+        staff.refresh_from_db()
+        self.assertFalse(staff.is_active)
+
+        # Disabled: the account cannot log in until it is turned back on.
+        self.assertEqual(
+            self.client.post(
+                reverse('login'), {'phone': staff.phone, 'password': 'Sup3rSecret!'},
+                format='json',
+            ).status_code,
+            400,
+        )
+
+        self.login('08011111111')
+        response = self.client.patch(
+            f'/api/users/{staff.id}/', {'is_active': True}, format='json',
+        )
+        self.assertEqual(response.status_code, 200, response.data)
+        staff.refresh_from_db()
+        self.assertTrue(staff.is_active)
+        self.login(staff.phone)
+
+    def test_staff_read_the_directory_but_cannot_change_it(self):
+        staff = User.objects.create_user(
+            phone='08077777777', password='Sup3rSecret!', full_name='Ward Clerk',
+            organization=self.hospital, role=Role.STAFF,
+        )
+        self.login(staff.phone)
+        self.assertEqual(self.client.get('/api/users/').status_code, 200)
+        self.assertEqual(
+            self.client.patch(
+                f'/api/users/{staff.id}/', {'role': Role.ADMIN}, format='json',
+            ).status_code,
+            403,
+        )
+        self.assertEqual(
+            self.client.post(
+                f'/api/users/{self.hospital_admin.id}/reset_password/',
+                {'new_password': 'An0therSecret!'}, format='json',
+            ).status_code,
+            403,
+        )
+
+    def test_an_administrator_edits_every_detail_of_a_staff_account(self):
+        staff = User.objects.create_user(
+            phone='08099999999', password='Sup3rSecret!', full_name='Wrong Name',
+            organization=self.hospital, role=Role.STAFF,
+        )
+        self.login('08011111111')
+        response = self.client.patch(
+            f'/api/users/{staff.id}/',
+            {
+                'full_name': 'Right Name', 'phone': '0808 888-8888',
+                'email': 'right@example.com', 'job_title': 'Ward Pharmacist',
+                'role': Role.ADMIN,
+            },
+            format='json',
+        )
+        self.assertEqual(response.status_code, 200, response.data)
+        staff.refresh_from_db()
+        self.assertEqual(staff.full_name, 'Right Name')
+        # Written in the normalised form, so the new number logs in as typed.
+        self.assertEqual(staff.phone, '08088888888')
+        self.assertEqual(staff.email, 'right@example.com')
+        self.assertEqual(staff.job_title, 'Ward Pharmacist')
+        self.assertEqual(staff.role, Role.ADMIN)
+        self.login('0808 888-8888')
+
+        # A number another account already holds is refused, spaced or not.
+        self.login('08011111111')
+        response = self.client.patch(
+            f'/api/users/{staff.id}/', {'phone': '0801-111 1111'}, format='json',
+        )
+        self.assertEqual(response.status_code, 400, response.data)
+        staff.refresh_from_db()
+        self.assertEqual(staff.phone, '08088888888')
+
+    def test_editing_stops_at_the_tenant_boundary(self):
+        outsider = User.objects.create_user(
+            phone='08012121212', password='Sup3rSecret!', full_name='Supplier Clerk',
+            organization=self.supplier, role=Role.STAFF,
+        )
+        self.login('08011111111')
+        self.assertEqual(
+            self.client.patch(
+                f'/api/users/{outsider.id}/', {'full_name': 'Renamed'}, format='json',
+            ).status_code,
+            404,
+        )

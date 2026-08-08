@@ -48,6 +48,14 @@ there: a unit holds no units of its own. Department names are unique within an
 organisation and unit names within their department, so two departments may each keep
 their own `HAEMATOLOGY`.
 
+An organisation administrator opens the accounts inside it, edits any detail of one —
+name, phone, email, job title and role, between `ADMIN` and `STAFF` — resets a forgotten password (the owner must change it at next login)
+and disables an account — `DELETE /users/{id}/`, which also cuts the login token.
+`PATCH /users/{id}/` with `is_active: true` turns it back on. Two things are refused, so a
+tenant can never be locked out of its own account management: nobody disables their own
+account, and the last active administrator can neither be demoted nor disabled — promote
+someone else first.
+
 A hospital can only trade with a company it has registered — that link is a
 `Partnership`, and every query is filtered through it. A supplier sees the requests
 addressed to it and nothing else; it never sees another hospital's drafts, and a
@@ -219,7 +227,7 @@ Everything lives under `/api/`. Authenticate with `Authorization: Token <key>`.
 | `GET/PATCH /organization/` | Own organisation profile |
 | `GET /dashboard/` | Counts, outstanding money, recent activity, and for a hospital what each department was invoiced |
 | `/companies/` | Hospital registers and manages supplier companies (administrators only; `DELETE` suspends trading, `POST /companies/{id}/reactivate/` resumes it) |
-| `/users/` | Staff accounts, `POST /users/{id}/reset_password/` |
+| `/users/` | Staff accounts (everyone reads; administrators write), `POST /users/{id}/reset_password/` |
 | `/departments/` | Hospital departments (everyone reads; administrators write) |
 | `/units/` | Units of those departments (`?department=<id>`; administrators write) |
 | `/products/` | Supplier catalogue (administrators write, `POST /products/{id}/restock/`); hospitals get a read-only view of partners |

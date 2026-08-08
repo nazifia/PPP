@@ -32,6 +32,7 @@ from .models import (
     ReqStatus,
     Requisition,
     RequisitionLine,
+    Role,
     StockMovement,
     Unit,
     User,
@@ -328,13 +329,56 @@ class UserViewSet(viewsets.ModelViewSet):
         serializer.save()
 
     def get_permissions(self):
-        if self.action in WRITE_ACTIONS:
+        # This override replaces the one the @action carries, so reset_password
+        # has to be named here or it falls back to any authenticated member of
+        # staff — who could then reset an administrator's password and log in
+        # as them.
+        if self.action in WRITE_ACTIONS + ('reset_password',):
             return [IsAuthenticated(), IsOrgAdmin()]
         return [IsAuthenticated()]
+
+    @staticmethod
+    def _is_last_admin(instance):
+        """Is this the only administrator the organisation has left?
+
+        An organisation with no active administrator is locked out of its own
+        account management: nobody can add a user, change a role or reset a
+        password again, and only the platform can put it right.
+        """
+        if instance.role != Role.ADMIN or not instance.is_active:
+            return False
+        return not User.objects.filter(
+            organization_id=instance.organization_id, role=Role.ADMIN, is_active=True,
+        ).exclude(pk=instance.pk).exists()
+
+    def perform_update(self, serializer):
+        instance = serializer.instance
+        data = serializer.validated_data
+        # Checked before the save, so a refusal leaves the row untouched.
+        steps_down = (
+            data.get('role', instance.role) != Role.ADMIN
+            or not data.get('is_active', instance.is_active)
+        )
+        if steps_down and self._is_last_admin(instance):
+            raise ValidationError(
+                'This is the only administrator left. Promote someone else first.'
+            )
+        was_active = instance.is_active
+        user = serializer.save()
+        if user.is_active and not was_active:
+            Token.objects.filter(user=user).delete()
+            audit(self.request.user, 'User', user.pk, 'ENABLED')
+        elif was_active and not user.is_active:
+            Token.objects.filter(user=user).delete()
+            audit(self.request.user, 'User', user.pk, 'DISABLED')
 
     def perform_destroy(self, instance):
         if instance == self.request.user:
             raise ValidationError('You cannot disable your own account.')
+        if self._is_last_admin(instance):
+            raise ValidationError(
+                'This is the only administrator left. Promote someone else first.'
+            )
         instance.is_active = False
         instance.save(update_fields=['is_active'])
         Token.objects.filter(user=instance).delete()

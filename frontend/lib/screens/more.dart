@@ -595,21 +595,41 @@ class _UsersScreenState extends State<UsersScreen> {
                                       if (context.mounted) showDone(context, 'Password reset.');
                                     } else if (choice == 'disable') {
                                       await api.delete('/users/${user['id']}/');
-                                    } else if (choice == 'admin' || choice == 'staff') {
+                                    } else if (choice == 'enable') {
                                       await api.patch('/users/${user['id']}/', {
-                                        'role': choice == 'admin' ? 'ADMIN' : 'STAFF',
+                                        'is_active': true,
                                       });
+                                    } else if (choice == 'edit') {
+                                      final saved = await showDialog<bool>(
+                                        context: context,
+                                        builder: (_) => _UserDialog(user: user),
+                                      );
+                                      if (saved != true) return;
                                     }
                                     reload();
                                   } catch (error) {
                                     if (context.mounted) showError(context, error);
                                   }
                                 },
-                                itemBuilder: (_) => const [
-                                  PopupMenuItem(value: 'reset', child: Text('Reset password')),
-                                  PopupMenuItem(value: 'admin', child: Text('Make administrator')),
-                                  PopupMenuItem(value: 'staff', child: Text('Make staff')),
-                                  PopupMenuItem(value: 'disable', child: Text('Disable account')),
+                                itemBuilder: (_) => [
+                                  const PopupMenuItem(
+                                    value: 'edit',
+                                    child: Text('Edit details'),
+                                  ),
+                                  const PopupMenuItem(
+                                    value: 'reset',
+                                    child: Text('Reset password'),
+                                  ),
+                                  if (user['is_active'] == true)
+                                    const PopupMenuItem(
+                                      value: 'disable',
+                                      child: Text('Disable account'),
+                                    )
+                                  else
+                                    const PopupMenuItem(
+                                      value: 'enable',
+                                      child: Text('Enable account'),
+                                    ),
                                 ],
                               )
                             : null,
@@ -626,21 +646,27 @@ class _UsersScreenState extends State<UsersScreen> {
 }
 
 class _UserDialog extends StatefulWidget {
-  const _UserDialog();
+  /// The account to edit, or null to open a new one.
+  const _UserDialog({this.user});
+
+  final Map<String, dynamic>? user;
 
   @override
   State<_UserDialog> createState() => _UserDialogState();
 }
 
 class _UserDialogState extends State<_UserDialog> {
-  final _fields = {
-    'full_name': TextEditingController(),
-    'phone': TextEditingController(),
-    'job_title': TextEditingController(),
-    'password': TextEditingController(),
+  late final Map<String, TextEditingController> _fields = {
+    for (final name in ['full_name', 'phone', 'email', 'job_title'])
+      name: TextEditingController(text: '${widget.user?[name] ?? ''}'),
+    // A password is set once here and changed afterwards by Reset password,
+    // which is the path that forces the owner to pick their own.
+    if (widget.user == null) 'password': TextEditingController(),
   };
-  String _role = 'STAFF';
+  late String _role = '${widget.user?['role'] ?? 'STAFF'}';
   bool _busy = false;
+
+  bool get _editing => widget.user != null;
 
   @override
   void dispose() {
@@ -653,7 +679,7 @@ class _UserDialogState extends State<_UserDialog> {
   @override
   Widget build(BuildContext context) {
     return AlertDialog(
-      title: const Text('New staff account'),
+      title: Text(_editing ? 'Edit ${widget.user!['full_name']}' : 'New staff account'),
       content: SizedBox(
         width: dialogWidth(context, 400),
         child: SingleChildScrollView(
@@ -694,15 +720,22 @@ class _UserDialogState extends State<_UserDialog> {
               : () async {
                   final api = ApiScope.of(context);
                   // No kind: a supplier opens staff accounts as a hospital does.
-                  final org = await orgField(context, api);
+                  // An existing account already sits in an organisation, and
+                  // moving it to another is not something this screen does.
+                  final org = _editing ? const <String, dynamic>{} : await orgField(context, api);
                   if (org == null || !context.mounted) return;
                   setState(() => _busy = true);
+                  final body = {
+                    for (final entry in _fields.entries) entry.key: entry.value.text.trim(),
+                    'role': _role,
+                    ...org,
+                  };
                   try {
-                    await api.post('/users/', {
-                      for (final entry in _fields.entries) entry.key: entry.value.text.trim(),
-                      'role': _role,
-                      ...org,
-                    });
+                    if (_editing) {
+                      await api.patch('/users/${widget.user!['id']}/', body);
+                    } else {
+                      await api.post('/users/', body);
+                    }
                     if (context.mounted) Navigator.pop(context, true);
                   } catch (error) {
                     if (context.mounted) showError(context, error);
@@ -710,7 +743,7 @@ class _UserDialogState extends State<_UserDialog> {
                     if (mounted) setState(() => _busy = false);
                   }
                 },
-          child: const Text('Create'),
+          child: Text(_editing ? 'Save' : 'Create'),
         ),
       ],
     );

@@ -88,6 +88,18 @@ class UserSerializer(serializers.ModelSerializer):
             'organization', 'is_superuser', 'must_change_password', 'date_joined',
         ]
 
+    def validate_phone(self, value):
+        # The model normalises on the way into the database, so the clash has to
+        # be looked for in the same form — otherwise `0803 123-4567` passes the
+        # field's own uniqueness check and then collides on save.
+        phone = normalize_phone(value)
+        clash = User.objects.filter(phone=phone)
+        if self.instance:
+            clash = clash.exclude(pk=self.instance.pk)
+        if clash.exists():
+            raise serializers.ValidationError('That phone number is already registered.')
+        return phone
+
 
 class UserCreateSerializer(serializers.ModelSerializer):
     password = serializers.CharField(write_only=True, validators=[validate_password])
