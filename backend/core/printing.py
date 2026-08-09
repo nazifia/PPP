@@ -113,7 +113,7 @@ def party(org):
 # ---------------------------------------------------------------------------
 
 def requisition_document(obj):
-    lines = obj.lines.select_related('product').all()
+    lines = obj.lines.select_related('product__unit').all()
     decided = obj.status not in ('DRAFT', 'SUBMITTED')
     return {
         'title': 'PURCHASE REQUEST',
@@ -138,7 +138,7 @@ def requisition_document(obj):
         ],
         'rows': [
             [
-                str(number), str(line.product), line.product.unit,
+                str(number), str(line.product), line.product.unit.name,
                 qty(line.qty_requested),
                 qty(line.qty_approved) if decided else DASH,
                 money(line.unit_price),
@@ -159,7 +159,7 @@ def requisition_document(obj):
 
 
 def delivery_document(obj):
-    lines = obj.lines.select_related('requisition_line__product').all()
+    lines = obj.lines.select_related('requisition_line__product__unit').all()
     verified = obj.status != DeliveryStatus.IN_TRANSIT
     return {
         'title': 'DELIVERY NOTE',
@@ -204,7 +204,7 @@ def invoice_document(obj):
     # An invoice is raised for what the hospital accepted, so those are the only
     # lines that belong on it.
     lines = [
-        line for line in obj.delivery.lines.select_related('requisition_line__product')
+        line for line in obj.delivery.lines.select_related('requisition_line__product__unit')
         if line.qty_accepted
     ]
     return {
@@ -232,7 +232,7 @@ def invoice_document(obj):
         'rows': [
             [
                 str(number), str(line.requisition_line.product),
-                line.requisition_line.product.unit,
+                line.requisition_line.product.unit.name,
                 qty(line.qty_accepted), money(line.requisition_line.unit_price),
                 money(line.accepted_value),
             ]

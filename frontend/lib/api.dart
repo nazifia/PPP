@@ -46,6 +46,12 @@ Duration _defaultIdleTimeout() {
 
 /// Session + thin REST client. One instance lives at the root of the app.
 class Api extends ChangeNotifier {
+  /// [client] is only passed by a test, which hands in `MockClient` to answer
+  /// without a server. The app leaves it alone.
+  Api({http.Client? client}) : _client = client ?? http.Client();
+
+  final http.Client _client;
+
   String baseUrl = _defaultBaseUrl();
   String? token;
   Map<String, dynamic>? user;
@@ -248,14 +254,14 @@ class Api extends ChangeNotifier {
   }
 
   Future<dynamic> get(String path, [Map<String, dynamic>? query]) =>
-      _send(() => http.get(_uri(path, query), headers: _headers));
+      _send(() => _client.get(_uri(path, query), headers: _headers));
 
   /// Raw bytes, with the session's token: a PDF the app hands to the printer.
   /// Longer than the usual patience, because the server renders it on the spot.
   Future<Uint8List> bytes(String path, [Map<String, dynamic>? query]) async {
     http.Response response;
     try {
-      response = await http
+      response = await _client
           .get(_uri(path, query), headers: _headers)
           .timeout(const Duration(seconds: 60));
     } catch (error) {
@@ -277,7 +283,7 @@ class Api extends ChangeNotifier {
   }
 
   Future<dynamic> post(String path, [Map<String, dynamic>? data]) =>
-      _send(() => http.post(_uri(path), headers: _headers, body: jsonEncode(data ?? {})));
+      _send(() => _client.post(_uri(path), headers: _headers, body: jsonEncode(data ?? {})));
 
   /// Same as [post], but with one file attached. Everything else travels as
   /// text, so the server reads it exactly like the JSON form.
@@ -292,16 +298,16 @@ class Api extends ChangeNotifier {
       ..headers.addAll({..._headers}..remove('Content-Type'))
       ..fields.addAll(fields.map((key, value) => MapEntry(key, '$value')))
       ..files.add(http.MultipartFile.fromBytes(field, bytes, filename: filename));
-    return http.Response.fromStream(await request.send());
+    return http.Response.fromStream(await _client.send(request));
   });
 
   Future<dynamic> patch(String path, Map<String, dynamic> data) =>
-      _send(() => http.patch(_uri(path), headers: _headers, body: jsonEncode(data)));
+      _send(() => _client.patch(_uri(path), headers: _headers, body: jsonEncode(data)));
 
   /// [query] carries what a request with no body cannot: a superuser naming
   /// the tenant a two-sided row such as a trading link belongs to.
   Future<dynamic> delete(String path, [Map<String, dynamic>? query]) =>
-      _send(() => http.delete(_uri(path, query), headers: _headers));
+      _send(() => _client.delete(_uri(path, query), headers: _headers));
 
   /// Unwraps a paginated list response into plain rows, dropping the page
   /// cursor. Enough for a list short enough to read in one screenful.

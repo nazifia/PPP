@@ -4,6 +4,7 @@ from django.contrib.auth import authenticate
 from django.contrib.auth.password_validation import validate_password
 from django.core.validators import FileExtensionValidator
 from django.db import transaction
+from django.db.models import Q
 from rest_framework import serializers
 
 from .models import (
@@ -11,6 +12,8 @@ from .models import (
     Delivery,
     DeliveryLine,
     Department,
+    DispensingUnit,
+    Formulation,
     HALF_UNIT,
     Invoice,
     OrgCategory,
@@ -284,8 +287,58 @@ class UnitSerializer(serializers.ModelSerializer):
         fields = ['id', 'name', 'full_name', 'department', 'department_name', 'is_active']
 
 
+def visible_terms(user, model):
+    """The standard rows of [model] plus whatever this caller's company defined."""
+    if user.sees_all_tenants:
+        return model.objects.all()
+    return model.objects.filter(
+        Q(supplier__isnull=True) | Q(supplier=user.scope_org),
+    )
+
+
+class CatalogueTermSerializer(serializers.ModelSerializer):
+    """Shared by the dispensing units and the formulations: same shape, same rules."""
+
+    is_shared = serializers.SerializerMethodField()
+
+    class Meta:
+        fields = ['id', 'name', 'supplier', 'is_shared', 'is_active']
+        read_only_fields = ['supplier']
+
+    def get_is_shared(self, term):
+        """A standard term, which no company may rename or retire."""
+        return term.supplier_id is None
+
+    def validate_name(self, value):
+        # The model's constraints cannot see past NULL, and a clash with a
+        # standard term would otherwise slip through as a duplicate offering.
+        name = value.strip().upper()
+        if not name:
+            raise serializers.ValidationError('This needs a name.')
+        clash = visible_terms(
+            self.context['request'].user, self.Meta.model,
+        ).filter(name=name)
+        if self.instance is not None:
+            clash = clash.exclude(pk=self.instance.pk)
+        if clash.exists():
+            raise serializers.ValidationError('That one already exists.')
+        return name
+
+
+class DispensingUnitSerializer(CatalogueTermSerializer):
+    class Meta(CatalogueTermSerializer.Meta):
+        model = DispensingUnit
+
+
+class FormulationSerializer(CatalogueTermSerializer):
+    class Meta(CatalogueTermSerializer.Meta):
+        model = Formulation
+
+
 class ProductSerializer(serializers.ModelSerializer):
     supplier_name = serializers.CharField(source='supplier.name', read_only=True)
+    unit_name = serializers.CharField(source='unit.name', read_only=True)
+    formulation_name = serializers.SerializerMethodField()
     availability = serializers.CharField(read_only=True)
     available_qty = QuantityField(read_only=True)
     stock_qty = QuantityField(min_value=Decimal('0'), required=False)
@@ -296,16 +349,34 @@ class ProductSerializer(serializers.ModelSerializer):
         model = Product
         fields = [
             'id', 'supplier', 'supplier_name', 'generic_name', 'brand', 'strength',
-            'formulation', 'unit', 'unit_price', 'stock_qty', 'qty_reserved',
-            'available_qty', 'max_order_qty', 'is_active', 'availability', 'updated_at',
+            'formulation', 'formulation_name', 'unit', 'unit_name', 'unit_price',
+            'stock_qty', 'qty_reserved', 'available_qty', 'max_order_qty',
+            'is_active', 'availability', 'updated_at',
         ]
         read_only_fields = ['supplier', 'qty_reserved']
+
+    def get_formulation_name(self, product):
+        """Empty rather than absent, since an item may name no form at all."""
+        return product.formulation.name if product.formulation_id else ''
+
+    def _check_own(self, term):
+        """Nobody describes an item with a term another company defined."""
+        user = self.context['request'].user
+        if not visible_terms(user, type(term)).filter(pk=term.pk).exists():
+            raise serializers.ValidationError('That belongs to another company.')
+        return term
+
+    def validate_unit(self, value):
+        return self._check_own(value)
+
+    def validate_formulation(self, value):
+        return value if value is None else self._check_own(value)
 
 
 class RequisitionLineSerializer(serializers.ModelSerializer):
     product_name = serializers.CharField(source='product.__str__', read_only=True)
     brand = serializers.CharField(source='product.brand', read_only=True)
-    unit = serializers.CharField(source='product.unit', read_only=True)
+    unit = serializers.CharField(source='product.unit.name', read_only=True)
     stock_qty = QuantityField(source='product.stock_qty', read_only=True)
     available_qty = QuantityField(source='product.available_qty', read_only=True)
     qty_supplied = QuantityField(read_only=True)

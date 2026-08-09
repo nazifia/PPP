@@ -268,6 +268,71 @@ class Unit(models.Model):
         return self.department.organization_id
 
 
+#: The dispensing units every company starts with. Seeded as shared rows by
+#: migration 0014; a supplier adds its own beside them rather than editing these.
+DISPENSING_UNITS = [
+    'UNIT', 'TABLET', 'CAPSULE', 'SACHET', 'BOTTLE', 'VIAL', 'AMPOULE',
+    'SYRINGE', 'SUPPOSITORY', 'TUBE', 'STRIP', 'PACK', 'CARTON', 'BOX',
+    'KIT', 'ROLL', 'PAIR', 'PIECE', 'ML', 'L', 'MG', 'G', 'KG', 'DROP',
+]
+
+#: The forms an item comes in, seeded the same way by migration 0016.
+FORMULATIONS = [
+    'TABLET', 'CAPSULE', 'SYRUP', 'SUSPENSION', 'SOLUTION', 'INJECTION',
+    'INFUSION', 'IVF', 'CREAM', 'OINTMENT', 'GEL', 'LOTION', 'DROPS',
+    'INHALER', 'SPRAY', 'POWDER', 'GRANULES', 'PESSARY', 'SUPPOSITORY',
+    'PATCH', 'REAGENT', 'CONSUMABLE', 'DEVICE',
+]
+
+
+class CatalogueTerm(models.Model):
+    """A word a supplier describes its catalogue with, picked rather than typed.
+
+    A row with no supplier is a standard term every company picks from. A
+    supplier may define its own beside them, and only it sees those.
+    """
+
+    supplier = models.ForeignKey(
+        Organization, null=True, blank=True, on_delete=models.CASCADE,
+        related_name='%(class)ss',
+        help_text='Blank for a standard term shared by every company.',
+    )
+    name = models.CharField(max_length=60)
+    is_active = models.BooleanField(default=True)
+
+    class Meta:
+        abstract = True
+        ordering = ['name']
+        constraints = [
+            models.UniqueConstraint(
+                fields=['supplier', 'name'], name='uniq_%(class)s_per_supplier',
+            ),
+            # NULL never equals NULL, so the constraint above lets two shared
+            # rows carry the same name. This one closes that hole.
+            models.UniqueConstraint(
+                fields=['name'], condition=models.Q(supplier__isnull=True),
+                name='uniq_shared_%(class)s',
+            ),
+        ]
+
+    def __str__(self):
+        return self.name
+
+    def save(self, *args, **kwargs):
+        # 'Tablet' and 'TABLET' are one term, and storing a single spelling is
+        # what keeps the constraints above meaning anything.
+        self.name = self.name.strip().upper()
+        return super().save(*args, **kwargs)
+
+
+class DispensingUnit(CatalogueTerm):
+    """A unit an item is dispensed in: TABLET, VIAL, KIT."""
+
+
+class Formulation(CatalogueTerm):
+    """The form an item comes in: SYRUP, INJECTION, REAGENT."""
+
+
 class Product(models.Model):
     """An item a supplier offers: drug, reagent or consumable."""
 
@@ -277,8 +342,15 @@ class Product(models.Model):
     generic_name = models.CharField(max_length=160)
     brand = models.CharField(max_length=120, blank=True)
     strength = models.CharField(max_length=60, blank=True)
-    formulation = models.CharField(max_length=60, blank=True)
-    unit = models.CharField(max_length=40, default='UNIT')
+    formulation = models.ForeignKey(
+        Formulation, null=True, blank=True, on_delete=models.PROTECT,
+        related_name='products',
+        help_text='The form it comes in. Picked from the formulations table.',
+    )
+    unit = models.ForeignKey(
+        DispensingUnit, on_delete=models.PROTECT, related_name='products',
+        help_text='How the item is dispensed. Picked from the units table.',
+    )
     unit_price = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal('0.00'))
     stock_qty = quantity_field(default=Decimal('0'))
     qty_reserved = quantity_field(

@@ -153,7 +153,7 @@ class _CatalogueScreenState extends State<CatalogueScreen> {
                       subtitle: Text(
                         [
                           if ('${item['brand']}'.isNotEmpty) item['brand'],
-                          if ('${item['formulation']}'.isNotEmpty) item['formulation'],
+                          if ('${item['formulation_name']}'.isNotEmpty) item['formulation_name'],
                           if (supplier)
                             qty(item['qty_reserved']) == 0
                                 ? 'stock ${qtyText(item['stock_qty'])}'
@@ -161,7 +161,7 @@ class _CatalogueScreenState extends State<CatalogueScreen> {
                                       '(${qtyText(item['qty_reserved'])} held)'
                           else
                             item['supplier_name'],
-                          '${amount(item['unit_price'])} / ${item['unit']}',
+                          '${amount(item['unit_price'])} / ${item['unit_name']}',
                         ].join(' · '),
                       ),
                       trailing: Row(
@@ -334,13 +334,46 @@ class _ProductDialog extends StatefulWidget {
   State<_ProductDialog> createState() => _ProductDialogState();
 }
 
+/// The picker row that defines a new entry rather than choosing one.
+const _newTerm = -1;
+
+/// One picked-not-typed field of the item form, and the list behind it: the
+/// standard entries the server offers plus whatever this company added.
+class _TermPicker {
+  _TermPicker({
+    required this.path,
+    required this.field,
+    required this.newTitle,
+    required this.hint,
+    this.fallback,
+    this.optional = false,
+  });
+
+  /// Where the list lives, e.g. `/dispensing-units/`.
+  final String path;
+
+  /// The product field it fills, which is also its label.
+  final String field;
+
+  final String newTitle;
+  final String hint;
+
+  /// What a new item starts on, by name. Null starts on nothing.
+  final String? fallback;
+
+  /// Whether the item may name none of these at all.
+  final bool optional;
+
+  List<Map<String, dynamic>> rows = [];
+  int? id;
+  bool loading = true;
+}
+
 class _ProductDialogState extends State<_ProductDialog> {
   late final Map<String, TextEditingController> _fields = {
     'generic_name': TextEditingController(text: '${widget.product?['generic_name'] ?? ''}'),
     'brand': TextEditingController(text: '${widget.product?['brand'] ?? ''}'),
     'strength': TextEditingController(text: '${widget.product?['strength'] ?? ''}'),
-    'formulation': TextEditingController(text: '${widget.product?['formulation'] ?? ''}'),
-    'unit': TextEditingController(text: '${widget.product?['unit'] ?? 'UNIT'}'),
     'unit_price': TextEditingController(text: '${widget.product?['unit_price'] ?? '0.00'}'),
     'stock_qty': TextEditingController(text: qtyText(widget.product?['stock_qty'] ?? 0)),
     'max_order_qty': TextEditingController(
@@ -350,6 +383,63 @@ class _ProductDialogState extends State<_ProductDialog> {
     ),
   };
   bool _busy = false;
+
+  /// Read from the server rather than held in the app, so an entry added on
+  /// another device is offered here too.
+  final _unit = _TermPicker(
+    path: '/dispensing-units/',
+    field: 'unit',
+    newTitle: 'New dispensing unit',
+    hint: 'e.g. JAR',
+    fallback: 'UNIT',
+  );
+  final _formulation = _TermPicker(
+    path: '/formulations/',
+    field: 'formulation',
+    newTitle: 'New formulation',
+    hint: 'e.g. LOZENGE',
+    optional: true,
+  );
+  late final _pickers = [_formulation, _unit];
+  bool _asked = false;
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    // ApiScope is only reachable once the widget is in the tree, which is why
+    // this is not initState.
+    if (_asked) return;
+    _asked = true;
+    for (final picker in _pickers) {
+      _load(picker);
+    }
+  }
+
+  Future<void> _load(_TermPicker picker) async {
+    try {
+      final rows = await ApiScope.of(context).list(picker.path);
+      if (!mounted) return;
+      setState(() {
+        picker.rows = rows;
+        picker.id = widget.product?[picker.field] as int? ?? _fallbackId(picker);
+        picker.loading = false;
+      });
+    } catch (error) {
+      if (!mounted) return;
+      setState(() => picker.loading = false);
+      showError(context, error);
+    }
+  }
+
+  /// What a new item starts on: the named fallback, or the first entry if some
+  /// company has retired that one. Nothing at all for an optional field.
+  int? _fallbackId(_TermPicker picker) {
+    if (picker.fallback == null || picker.rows.isEmpty) return null;
+    return picker.rows.firstWhere(
+      (row) => row['name'] == picker.fallback,
+      orElse: () => picker.rows.first,
+    )['id'] as int;
+  }
 
   @override
   void dispose() {
@@ -361,6 +451,10 @@ class _ProductDialogState extends State<_ProductDialog> {
 
   Future<void> _save() async {
     final api = ApiScope.of(context);
+    if (_unit.id == null) {
+      showError(context, 'Pick the unit this item is dispensed in.');
+      return;
+    }
     // Only a new item needs the tenant named; an edit takes it from the row.
     var org = const <String, dynamic>{};
     if (widget.product == null) {
@@ -373,6 +467,7 @@ class _ProductDialogState extends State<_ProductDialog> {
       for (final entry in _fields.entries)
         if (entry.key != 'max_order_qty' || entry.value.text.trim().isNotEmpty)
           entry.key: entry.value.text.trim(),
+      for (final picker in _pickers) picker.field: picker.id,
     };
     if (body['max_order_qty'] == null) body['max_order_qty'] = null;
     try {
@@ -389,6 +484,62 @@ class _ProductDialogState extends State<_ProductDialog> {
     }
   }
 
+  /// Define an entry the standard list has no name for, without leaving the
+  /// item being priced.
+  Future<void> _addTerm(_TermPicker picker) async {
+    final name = await promptText(context, title: picker.newTitle, hint: picker.hint);
+    if (name == null || name.trim().isEmpty || !mounted) return;
+    try {
+      final created =
+          await ApiScope.of(context).post(picker.path, {'name': name})
+              as Map<String, dynamic>;
+      if (!mounted) return;
+      setState(() {
+        picker.rows = [...picker.rows, created]
+          ..sort((a, b) => '${a['name']}'.compareTo('${b['name']}'));
+        picker.id = created['id'] as int;
+      });
+    } catch (error) {
+      if (mounted) showError(context, error);
+    }
+  }
+
+  /// Picked, never typed: a catalogue selling the same thing in PACK and in
+  /// Packs cannot be totalled.
+  Widget _termField(_TermPicker picker) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 10),
+      child: DropdownButtonFormField<int>(
+        // The field keeps its own copy of the value, so one set from code —
+        // the first load, or an entry just defined — needs a fresh field.
+        key: ValueKey('${picker.field}:${picker.id}'),
+        initialValue: picker.id,
+        isDense: true,
+        decoration: InputDecoration(
+          labelText: picker.field,
+          isDense: true,
+          helperText: picker.loading ? 'Loading…' : null,
+        ),
+        items: [
+          if (picker.optional)
+            const DropdownMenuItem(value: null, child: Text('—')),
+          for (final row in picker.rows)
+            DropdownMenuItem(value: row['id'] as int, child: Text('${row['name']}')),
+          const DropdownMenuItem(value: _newTerm, child: Text('New…')),
+        ],
+        onChanged: picker.loading
+            ? null
+            : (picked) {
+                if (picked == _newTerm) {
+                  _addTerm(picker);
+                } else {
+                  setState(() => picker.id = picked);
+                }
+              },
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return AlertDialog(
@@ -399,7 +550,10 @@ class _ProductDialogState extends State<_ProductDialog> {
           child: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
-              for (final entry in _fields.entries)
+              for (final entry in _fields.entries) ...[
+                // Both belong beside the price the unit is charged per.
+                if (entry.key == 'unit_price')
+                  for (final picker in _pickers) _termField(picker),
                 Padding(
                   padding: const EdgeInsets.only(bottom: 10),
                   child: TextField(
@@ -414,6 +568,7 @@ class _ProductDialogState extends State<_ProductDialog> {
                     ),
                   ),
                 ),
+              ],
             ],
           ),
         ),

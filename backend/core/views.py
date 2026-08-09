@@ -21,6 +21,8 @@ from .models import (
     AuditLog,
     Delivery,
     Department,
+    DispensingUnit,
+    Formulation,
     Invoice,
     InvoiceStatus,
     OrgKind,
@@ -48,6 +50,8 @@ from .serializers import (
     DispenseSerializer,
     DeliverySerializer,
     DepartmentSerializer,
+    DispensingUnitSerializer,
+    FormulationSerializer,
     DispatchSerializer,
     HospitalRegisterSerializer,
     InvoiceSerializer,
@@ -67,6 +71,7 @@ from .serializers import (
     UserSerializer,
     VerifySerializer,
     WishlistAddSerializer,
+    visible_terms,
 )
 
 
@@ -461,13 +466,79 @@ class UnitViewSet(viewsets.ModelViewSet):
         serializer.save()
 
 
+class CatalogueTermViewSet(viewsets.ModelViewSet):
+    """The standard terms of one kind, plus the ones this company defined itself.
+
+    Subclassed once per vocabulary; `model` and `serializer_class` are all a
+    subclass carries, since the rules are the same for every one of them.
+    """
+
+    model = None
+    permission_classes = [IsAuthenticated]
+    filter_backends = [filters.SearchFilter]
+    search_fields = ['name']
+    # A picker needs every row at once, and there are only ever a few dozen.
+    pagination_class = None
+
+    def get_queryset(self):
+        return visible_terms(self.request.user, self.model)
+
+    def get_permissions(self):
+        # Every account reads the list, because a hospital reading a catalogue
+        # is reading the terms each item is described by. Defining one is a
+        # supplier administrator's call, like the catalogue itself.
+        if self.action in WRITE_ACTIONS:
+            return [IsAuthenticated(), IsOrgAdmin()]
+        return [IsAuthenticated()]
+
+    def perform_create(self, serializer):
+        user = self.request.user
+        if user.org_kind != OrgKind.SUPPLIER:
+            raise PermissionDenied('Only a supplier can define one of these.')
+        require_org(user)
+        term = serializer.save(supplier=user.scope_org)
+        audit(user, self.model.__name__, term.pk, 'CREATED', name=term.name)
+
+    def _require_own(self, term):
+        """A standard term is nobody's to edit; another company's is not mine."""
+        if term.supplier_id is None:
+            raise PermissionDenied('A standard entry cannot be changed.')
+        services.require_owner(
+            self.request.user, term.supplier,
+            'Only the company that defined this can change it.',
+        )
+
+    def perform_update(self, serializer):
+        self._require_own(serializer.instance)
+        serializer.save()
+
+    def perform_destroy(self, instance):
+        self._require_own(instance)
+        # The column protects itself, but a database error is not an answer.
+        if instance.products.exists():
+            raise ValidationError('Items in the catalogue still use this.')
+        instance.delete()
+
+
+class DispensingUnitViewSet(CatalogueTermViewSet):
+    model = DispensingUnit
+    serializer_class = DispensingUnitSerializer
+
+
+class FormulationViewSet(CatalogueTermViewSet):
+    model = Formulation
+    serializer_class = FormulationSerializer
+
+
 class ProductViewSet(viewsets.ModelViewSet):
     """Suppliers manage their own catalogue; hospitals read their partners' catalogues."""
 
     serializer_class = ProductSerializer
     permission_classes = [IsAuthenticated]
     filter_backends = [filters.SearchFilter, filters.OrderingFilter]
-    search_fields = ['generic_name', 'brand', 'formulation', 'strength', 'supplier__name']
+    search_fields = [
+        'generic_name', 'brand', 'formulation__name', 'strength', 'supplier__name',
+    ]
     ordering_fields = ['generic_name', 'unit_price', 'stock_qty', 'updated_at']
 
     def get_queryset(self):
@@ -486,7 +557,7 @@ class ProductViewSet(viewsets.ModelViewSet):
             queryset = queryset.filter(supplier_id=supplier_id)
         if self.request.query_params.get('available') == 'true':
             queryset = queryset.filter(stock_qty__gt=F('qty_reserved'))
-        return queryset.select_related('supplier')
+        return queryset.select_related('supplier', 'unit', 'formulation')
 
     def get_permissions(self):
         # Prices and stock levels are what the company sells on, so every member
@@ -757,7 +828,7 @@ class RequisitionLineViewSet(
         user = self.request.user
         return RequisitionLine.objects.filter(
             **org_scope(user, requisition__hospital=user.scope_org),
-        ).select_related('requisition', 'product')
+        ).select_related('requisition', 'product__unit')
 
     def _check_draft(self, requisition):
         if requisition.status != ReqStatus.DRAFT:

@@ -18,6 +18,7 @@ from rest_framework.test import APITestCase
 
 from .models import (
     Department,
+    DispensingUnit,
     Invoice,
     InvoiceStatus,
     OrgKind,
@@ -53,8 +54,11 @@ class SupplyFlowTests(APITestCase):
             organization=self.supplier, role=Role.ADMIN,
         )
         Partnership.objects.create(hospital=self.hospital, supplier=self.supplier)
+        # Seeded as shared rows by migration 0014, so every test starts with the
+        # standard units already there.
+        self.carton = DispensingUnit.objects.get(supplier=None, name='CARTON')
         self.product = Product.objects.create(
-            supplier=self.supplier, generic_name='10% Dextrose Water', unit='CARTON',
+            supplier=self.supplier, generic_name='10% Dextrose Water', unit=self.carton,
             unit_price='720.00', stock_qty=100,
         )
 
@@ -691,9 +695,109 @@ class SupplyFlowTests(APITestCase):
         )
         self.assertEqual(response.status_code, 400)
 
+    def test_supplier_defines_and_sells_in_its_own_dispensing_unit(self):
+        self.login('08022222222')
+        created = self.client.post('/api/dispensing-units/', {'name': 'jar'}, format='json')
+        self.assertEqual(created.status_code, 201, created.data)
+        # One spelling per unit, whatever case it was typed in.
+        self.assertEqual(created.data['name'], 'JAR')
+        product = self.client.post(
+            '/api/products/',
+            {'generic_name': 'Vaseline', 'unit': created.data['id'], 'unit_price': '900.00'},
+            format='json',
+        )
+        self.assertEqual(product.status_code, 201, product.data)
+        self.assertEqual(product.data['unit_name'], 'JAR')
+        # A standard unit is already on offer, so redefining it is a duplicate.
+        clash = self.client.post('/api/dispensing-units/', {'name': 'CARTON'}, format='json')
+        self.assertEqual(clash.status_code, 400)
+
+    def test_one_supplier_never_sells_in_another_companys_unit(self):
+        rival = Organization.objects.create(
+            name='Rival Supplies', kind=OrgKind.SUPPLIER, phone='08000000009',
+        )
+        User.objects.create_user(
+            phone='08099999999', password='Sup3rSecret!', full_name='Rival Admin',
+            organization=rival, role=Role.ADMIN,
+        )
+        self.login('08099999999')
+        theirs = self.client.post(
+            '/api/dispensing-units/', {'name': 'DRUM'}, format='json',
+        ).data
+
+        self.login('08022222222')
+        listed = self.client.get('/api/dispensing-units/', {'search': 'DRUM'}).data
+        self.assertEqual(listed, [])
+        refused = self.client.post(
+            '/api/products/',
+            {'generic_name': 'Spirit', 'unit': theirs['id'], 'unit_price': '100.00'},
+            format='json',
+        )
+        self.assertEqual(refused.status_code, 400)
+
+    def test_standard_unit_is_fixed_and_a_unit_in_use_is_not_deleted(self):
+        self.login('08022222222')
+        shared = self.client.patch(
+            f'/api/dispensing-units/{self.carton.id}/', {'name': 'CRATE'}, format='json',
+        )
+        self.assertEqual(shared.status_code, 403)
+        mine = self.client.post(
+            '/api/dispensing-units/', {'name': 'JAR'}, format='json',
+        ).data
+        # Its own it may rename, which is what the More screen offers.
+        renamed = self.client.patch(
+            f'/api/dispensing-units/{mine["id"]}/', {'name': 'tub'}, format='json',
+        )
+        self.assertEqual(renamed.status_code, 200, renamed.data)
+        self.assertEqual(renamed.data['name'], 'TUB')
+        moved = self.client.patch(
+            f'/api/products/{self.product.id}/', {'unit': mine['id']}, format='json',
+        )
+        self.assertEqual(moved.status_code, 200, moved.data)
+        in_use = self.client.delete(f'/api/dispensing-units/{mine["id"]}/')
+        self.assertEqual(in_use.status_code, 400)
+
+    def test_formulation_is_picked_defined_and_still_optional(self):
+        self.login('08022222222')
+        standard = self.client.get('/api/formulations/', {'search': 'SYRUP'}).data
+        self.assertEqual([row['name'] for row in standard], ['SYRUP'])
+        mine = self.client.post('/api/formulations/', {'name': 'lozenge'}, format='json')
+        self.assertEqual(mine.status_code, 201, mine.data)
+
+        described = self.client.post(
+            '/api/products/',
+            {
+                'generic_name': 'Strepsils', 'formulation': mine.data['id'],
+                'unit': self.carton.id, 'unit_price': '450.00',
+            },
+            format='json',
+        )
+        self.assertEqual(described.status_code, 201, described.data)
+        self.assertEqual(described.data['formulation_name'], 'LOZENGE')
+
+        # An item that comes in no particular form still goes in the catalogue.
+        bare = self.client.post(
+            '/api/products/',
+            {'generic_name': 'Sterile Water', 'unit': self.carton.id, 'unit_price': '80.00'},
+            format='json',
+        )
+        self.assertEqual(bare.status_code, 201, bare.data)
+        self.assertIsNone(bare.data['formulation'])
+        self.assertEqual(bare.data['formulation_name'], '')
+
+        # And the rules the units follow hold here too.
+        self.assertEqual(
+            self.client.post('/api/formulations/', {'name': 'SYRUP'}, format='json').status_code,
+            400,
+        )
+        self.assertEqual(
+            self.client.delete(f'/api/formulations/{mine.data["id"]}/').status_code, 400,
+        )
+
     def test_stock_ledger_filters_by_product_and_kind(self):
         other = Product.objects.create(
-            supplier=self.supplier, generic_name='Paracetamol', unit='PACK',
+            supplier=self.supplier, generic_name='Paracetamol',
+            unit=DispensingUnit.objects.get(supplier=None, name='PACK'),
             unit_price='100.00', stock_qty=10,
         )
         StockMovement.objects.create(

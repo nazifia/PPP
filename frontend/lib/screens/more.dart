@@ -52,6 +52,32 @@ class MoreScreen extends StatelessWidget {
                 title: const Text('Departments'),
                 onTap: () => open(const DepartmentsScreen()),
               ),
+            if (api.canActAsSupplier) ...[
+              ListTile(
+                leading: const Icon(Icons.straighten),
+                title: const Text('Dispensing units'),
+                subtitle: const Text('What the catalogue sells in'),
+                onTap: () => open(
+                  const CatalogueTermsScreen(
+                    path: '/dispensing-units/',
+                    title: 'Dispensing units',
+                    label: 'dispensing unit',
+                  ),
+                ),
+              ),
+              ListTile(
+                leading: const Icon(Icons.science_outlined),
+                title: const Text('Formulations'),
+                subtitle: const Text('The forms items come in'),
+                onTap: () => open(
+                  const CatalogueTermsScreen(
+                    path: '/formulations/',
+                    title: 'Formulations',
+                    label: 'formulation',
+                  ),
+                ),
+              ),
+            ],
             ListTile(
               leading: const Icon(Icons.receipt_long),
               title: Text(api.isSupplier ? 'Invoices receivable' : 'Invoices payable'),
@@ -501,6 +527,135 @@ class _DepartmentsScreenState extends State<DepartmentsScreen> {
                               )
                             : null,
                       ),
+                  ],
+                );
+              },
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// One of the catalogue's picked-not-typed lists: dispensing units, or the
+/// forms items come in. One screen for both, since the rules are the same —
+/// the standard entries are read-only and a company's own are its to edit.
+class CatalogueTermsScreen extends StatefulWidget {
+  const CatalogueTermsScreen({
+    super.key,
+    required this.path,
+    required this.title,
+    required this.label,
+  });
+
+  /// The list endpoint, e.g. `/dispensing-units/`.
+  final String path;
+
+  final String title;
+
+  /// What one row is called, for the prompts: 'dispensing unit'.
+  final String label;
+
+  @override
+  State<CatalogueTermsScreen> createState() => _CatalogueTermsScreenState();
+}
+
+class _CatalogueTermsScreenState extends State<CatalogueTermsScreen> {
+  final _controller = LoaderController();
+  final _search = TextEditingController();
+
+  @override
+  void dispose() {
+    _search.dispose();
+    _controller.dispose();
+    super.dispose();
+  }
+
+  Future<void> _add(Api api) async {
+    final name = await promptText(context, title: 'New ${widget.label}');
+    if (name == null || name.trim().isEmpty || !mounted) return;
+    try {
+      await api.post(widget.path, {'name': name.trim()});
+      _controller.reload();
+    } catch (error) {
+      if (mounted) showError(context, error);
+    }
+  }
+
+  Future<void> _rename(Api api, Map<String, dynamic> row) async {
+    final name = await promptText(
+      context, title: 'Rename ${widget.label}', initial: '${row['name']}',
+    );
+    if (name == null || name.trim().isEmpty || !mounted) return;
+    try {
+      await api.patch('${widget.path}${row['id']}/', {'name': name.trim()});
+      _controller.reload();
+    } catch (error) {
+      if (mounted) showError(context, error);
+    }
+  }
+
+  Future<void> _delete(Api api, Map<String, dynamic> row) async {
+    if (!await confirm(context, 'Delete', 'Remove ${row['name']}?')) return;
+    try {
+      await api.delete('${widget.path}${row['id']}/');
+      _controller.reload();
+    } catch (error) {
+      // The commonest refusal is that catalogue items still use it, which the
+      // server says in words worth showing.
+      if (mounted) showError(context, error);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final api = ApiScope.of(context);
+    // Only a supplier defines these, and only its administrator.
+    final canEdit = api.isSupplier && api.isAdmin;
+    return Scaffold(
+      appBar: AppBar(title: Text(widget.title)),
+      floatingActionButton: canEdit
+          ? FloatingActionButton(
+              onPressed: () => _add(api),
+              child: const Icon(Icons.add),
+            )
+          : null,
+      body: Column(
+        children: [
+          DebouncedSearch(
+            controller: _search,
+            onChanged: _controller.reload,
+            hintText: 'Search ${widget.title.toLowerCase()}',
+          ),
+          Expanded(
+            child: Loader<List<Map<String, dynamic>>>(
+              controller: _controller,
+              load: () => api.list(widget.path, {'search': _search.text}),
+              builder: (context, rows, reload) {
+                if (rows.isEmpty) return EmptyState('No ${widget.label}s yet.');
+                return ListView(
+                  children: [
+                    for (final row in rows)
+                      if (row['is_shared'] == true)
+                        ListTile(
+                          leading: const Icon(Icons.lock_outline),
+                          title: Text('${row['name']}'),
+                          subtitle: const Text('Standard — the same for every company'),
+                        )
+                      else
+                        ListTile(
+                          leading: const Icon(Icons.edit_outlined),
+                          title: Text('${row['name']}'),
+                          subtitle: const Text('Yours'),
+                          onTap: canEdit ? () => _rename(api, row) : null,
+                          trailing: canEdit
+                              ? IconButton(
+                                  icon: const Icon(Icons.delete_outline, size: 20),
+                                  onPressed: () => _delete(api, row),
+                                )
+                              : null,
+                        ),
                   ],
                 );
               },

@@ -9,6 +9,8 @@ from django.core.management.base import BaseCommand
 
 from core.models import (
     Department,
+    DispensingUnit,
+    Formulation,
     OrgCategory,
     OrgKind,
     Organization,
@@ -75,9 +77,11 @@ class Command(BaseCommand):
                     supplier=supplier,
                     generic_name=generic,
                     defaults={
-                        'formulation': formulation,
+                        'formulation': Formulation.objects.get(
+                            supplier=None, name=formulation.upper(),
+                        ),
                         'strength': strength,
-                        'unit': unit,
+                        'unit': DispensingUnit.objects.get(supplier=None, name=unit),
                         'unit_price': price,
                         'stock_qty': stock,
                     },

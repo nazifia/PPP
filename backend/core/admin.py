@@ -5,6 +5,8 @@ from .models import (
     Delivery,
     DeliveryLine,
     Department,
+    DispensingUnit,
+    Formulation,
     Invoice,
     Organization,
     Partnership,
@@ -85,4 +87,6 @@ class AuditLogAdmin(admin.ModelAdmin):
     list_filter = ['action', 'entity']
 
 
-admin.site.register([Partnership, Department, Unit, StockMovement])
+admin.site.register(
+    [Partnership, Department, DispensingUnit, Formulation, Unit, StockMovement],
+)
