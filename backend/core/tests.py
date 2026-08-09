@@ -1,15 +1,17 @@
 """End-to-end check of the request lifecycle and of tenant isolation."""
 
 import io
+import os
 import tempfile
 from datetime import timedelta
 from decimal import Decimal
 from io import StringIO
+from pathlib import Path
 from unittest.mock import patch
 
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.core.management import call_command
-from django.test import override_settings
+from django.test import TestCase, override_settings
 from django.urls import reverse
 from django.utils import timezone
 from pypdf import PdfReader
@@ -1991,3 +1993,61 @@ class SupplyFlowTests(APITestCase):
             ).status_code,
             404,
         )
+
+
+class RuntimeModeTests(TestCase):
+    """The development/production switch on the admin site."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.env_file = Path(tmp.name) / '.django_env'
+        self.superuser = User.objects.create_superuser(
+            phone='08099999999', password='Sup3rSecret!',
+        )
+
+    def switch(self, mode):
+        with override_settings(ENV_FILE=self.env_file):
+            return self.client.post('/admin/env/', {'mode': mode}, follow=True)
+
+    def saved(self):
+        return self.env_file.read_text() if self.env_file.exists() else None
+
+    def test_only_a_superuser_reaches_the_page(self):
+        # Signed out: the admin login stands in the way.
+        self.assertEqual(self.client.get('/admin/env/').status_code, 302)
+
+        staff = User.objects.create_user(
+            phone='08088888888', password='Sup3rSecret!', full_name='Desk Staff',
+            is_staff=True,
+        )
+        self.client.force_login(staff)
+        self.assertEqual(self.client.get('/admin/env/').status_code, 403)
+
+        self.client.force_login(self.superuser)
+        self.assertEqual(self.client.get('/admin/env/').status_code, 200)
+        # And the admin header carries the way in.
+        self.assertContains(self.client.get('/admin/'), '/admin/env/')
+
+    @patch.dict(os.environ, {'DJANGO_SECRET_KEY': '', 'DJANGO_ALLOWED_HOSTS': ''})
+    def test_production_is_refused_until_the_environment_is_ready(self):
+        os.environ.pop('DJANGO_ENV', None)
+        self.client.force_login(self.superuser)
+
+        self.switch('prod')
+        # Nothing written: the next start would have died on the missing secret.
+        self.assertIsNone(self.saved())
+
+        os.environ['DJANGO_SECRET_KEY'] = 'a-real-one'
+        os.environ['DJANGO_ALLOWED_HOSTS'] = 'example.com'
+        self.switch('prod')
+        self.assertEqual(self.saved(), 'prod')
+
+        self.switch('dev')
+        self.assertEqual(self.saved(), 'dev')
+
+    @patch.dict(os.environ, {'DJANGO_ENV': 'dev'})
+    def test_the_environment_wins_over_the_page(self):
+        self.client.force_login(self.superuser)
+        self.switch('prod')
+        self.assertIsNone(self.saved())

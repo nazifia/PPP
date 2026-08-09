@@ -1,0 +1,14 @@
+{% extends "admin/base.html" %}
+{# Django's own admin/base_site.html, plus the Runtime mode link. The admin
+   chrome has no other place to hang a page that belongs to no model. #}
+
+{% block title %}{% if subtitle %}{{ subtitle }} | {% endif %}{{ title }} | {{ site_title|default:_('Django site admin') }}{% endblock %}
+
+{% block branding %}
+<div id="site-name"><a href="{% url 'admin:index' %}">{{ site_header|default:_('Django administration') }}</a></div>
+{% if user.is_anonymous %}
+  {% include "admin/color_theme_toggle.html" %}
+{% endif %}
+{% endblock %}
+
+{% block nav-global %}{% if user.is_superuser %}<a href="{% url 'admin-env' %}">Runtime mode</a>{% endif %}{% endblock %}

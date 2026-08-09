@@ -20,8 +20,12 @@ from django.contrib import admin
 from django.urls import include, path
 
 from core import printing
+from core.admin import env_switch
 
 urlpatterns = [
+    # Ahead of admin.site.urls so it keeps the /admin/ prefix and the admin
+    # login wrapper without the admin site having to know about it.
+    path('admin/env/', admin.site.admin_view(env_switch), name='admin-env'),
     path('admin/', admin.site.urls),
     path('api/', include('core.urls')),
     # Printable paper, outside /api/ because a browser opens it directly with a

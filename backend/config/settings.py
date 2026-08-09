@@ -29,7 +29,26 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 #   DJANGO_CORS_ORIGINS=https://example.com        (browser clients)
 #
 # See https://docs.djangoproject.com/en/6.1/howto/deployment/checklist/
-PROD = os.environ.get('DJANGO_ENV', 'dev').lower() in ('prod', 'production')
+#
+# A superuser with no shell can flip the same switch from /admin/env/, which
+# writes the word to ENV_FILE. The environment wins wherever it is set, so a
+# deployment that exports DJANGO_ENV cannot be talked out of it through a
+# browser. Either way the mode is read once, at startup: a change needs a
+# restart before it means anything.
+ENV_FILE = BASE_DIR / '.django_env'
+
+
+def _env_mode():
+    mode = os.environ.get('DJANGO_ENV')
+    if mode is None:
+        try:
+            mode = ENV_FILE.read_text()
+        except OSError:
+            mode = ''
+    return mode.strip().lower()
+
+
+PROD = _env_mode() in ('prod', 'production')
 
 DEBUG = not PROD
 
@@ -107,7 +126,7 @@ ROOT_URLCONF = 'config.urls'
 TEMPLATES = [
     {
         'BACKEND': 'django.template.backends.django.DjangoTemplates',
-        'DIRS': [],
+        'DIRS': [BASE_DIR / 'templates'],
         'APP_DIRS': True,
         'OPTIONS': {
             'context_processors': [

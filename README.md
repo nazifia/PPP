@@ -265,6 +265,13 @@ DJANGO_DB_PATH=/var/lib/ppp/db.sqlite3       # optional, defaults next to manage
 DJANGO_SSL_REDIRECT=0                        # optional, if the proxy already redirects
 ```
 
+A superuser with the admin site but no shell can flip the same switch from **Runtime mode**
+in the admin header (`/admin/env/`), which writes `dev` or `prod` to `backend/.django_env`.
+It refuses to save `prod` while the secret key or the allowed hosts are missing, since that
+would leave the next start raising `ImproperlyConfigured` with no admin left to fix it from.
+Either way the mode is read once, at startup, so a change needs a restart; and `DJANGO_ENV`
+in the environment wins over the file wherever it is set.
+
 `python manage.py check --deploy` with those set should come back clean. The rest is
 outside Django:
 
