@@ -12,22 +12,55 @@ https://docs.djangoproject.com/en/6.1/ref/settings/
 import os
 from pathlib import Path
 
+from django.core.exceptions import ImproperlyConfigured
+
 from corsheaders.defaults import default_headers
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 
-# Quick-start development settings - unsuitable for production
+# One settings file, two modes. Development is the default so `manage.py
+# runserver` keeps working with no setup; production is opt-in:
+#
+#   DJANGO_ENV=prod
+#   DJANGO_SECRET_KEY=<something long and random>
+#   DJANGO_ALLOWED_HOSTS=api.example.com,example.com
+#   DJANGO_CORS_ORIGINS=https://example.com        (browser clients)
+#
 # See https://docs.djangoproject.com/en/6.1/howto/deployment/checklist/
+PROD = os.environ.get('DJANGO_ENV', 'dev').lower() in ('prod', 'production')
+
+DEBUG = not PROD
+
+
+def _env_list(name):
+    return [v.strip() for v in os.environ.get(name, '').split(',') if v.strip()]
+
 
 # SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = 'django-insecure-g(ro+^za612a4*7h^dvtpmwwnjy%_*@g_1c54&6f#l&9&5hf37'
+SECRET_KEY = os.environ.get(
+    'DJANGO_SECRET_KEY',
+    'django-insecure-g(ro+^za612a4*7h^dvtpmwwnjy%_*@g_1c54&6f#l&9&5hf37',
+)
 
-# SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = True
+ALLOWED_HOSTS = _env_list('DJANGO_ALLOWED_HOSTS') if PROD else ['*']
 
-ALLOWED_HOSTS = ['*'] if DEBUG else []
+if PROD:
+    # Fail at startup rather than serve a production site with dev secrets.
+    if SECRET_KEY.startswith('django-insecure-'):
+        raise ImproperlyConfigured('DJANGO_SECRET_KEY must be set when DJANGO_ENV=prod')
+    if not ALLOWED_HOSTS:
+        raise ImproperlyConfigured('DJANGO_ALLOWED_HOSTS must be set when DJANGO_ENV=prod')
+
+    # Assumes TLS terminates at the proxy in front of Django.
+    SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
+    SECURE_SSL_REDIRECT = os.environ.get('DJANGO_SSL_REDIRECT', '1') == '1'
+    SESSION_COOKIE_SECURE = True
+    CSRF_COOKIE_SECURE = True
+    SECURE_HSTS_SECONDS = 31536000
+    SECURE_HSTS_INCLUDE_SUBDOMAINS = True
+    CSRF_TRUSTED_ORIGINS = _env_list('DJANGO_CORS_ORIGINS')
 
 
 # Application definition
@@ -92,10 +125,14 @@ WSGI_APPLICATION = 'config.wsgi.application'
 # Database
 # https://docs.djangoproject.com/en/6.1/ref/settings/#databases
 
+# ponytail: sqlite in both modes — one pharmacy per deployment, low write
+# concurrency. Point DJANGO_DB_PATH at a volume that survives redeploys; move to
+# MySQL (needs mysqlclient, not in requirements.txt yet) when concurrent writers
+# start hitting "database is locked".
 DATABASES = {
     'default': {
         'ENGINE': 'django.db.backends.sqlite3',
-        'NAME': BASE_DIR / 'db.sqlite3',
+        'NAME': os.environ.get('DJANGO_DB_PATH') or BASE_DIR / 'db.sqlite3',
     }
 }
 
@@ -152,8 +189,10 @@ MAILERS = {
     },
 }
 
-# ponytail: dev-only wide-open CORS; replace with CORS_ALLOWED_ORIGINS list before deploy
-CORS_ALLOW_ALL_ORIGINS = DEBUG
+# Wide open in development; in production only the hosts named in
+# DJANGO_CORS_ORIGINS may call the API from a browser.
+CORS_ALLOW_ALL_ORIGINS = not PROD
+CORS_ALLOWED_ORIGINS = _env_list('DJANGO_CORS_ORIGINS') if PROD else []
 
 # The superuser's tenant switch travels in a header, so browsers must be told
 # it is allowed through.

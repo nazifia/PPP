@@ -252,12 +252,27 @@ cd frontend && flutter test                  # app shell smoke tests
 
 ## Before deploying
 
-- `DEBUG = False`, a real `SECRET_KEY` from the environment, and `ALLOWED_HOSTS` filled in.
-- Replace `CORS_ALLOW_ALL_ORIGINS` with an explicit `CORS_ALLOWED_ORIGINS` list.
+Set `DJANGO_ENV=prod` and the settings file flips over by itself: `DEBUG` off, secure
+cookies, HSTS, HTTPS redirect, and CORS narrowed to the origins you name. It refuses to
+start until the two things it cannot guess are in the environment:
+
+```bash
+DJANGO_ENV=prod
+DJANGO_SECRET_KEY=<long random value>
+DJANGO_ALLOWED_HOSTS=api.example.com,example.com
+DJANGO_CORS_ORIGINS=https://example.com      # browser clients, also CSRF-trusted
+DJANGO_DB_PATH=/var/lib/ppp/db.sqlite3       # optional, defaults next to manage.py
+DJANGO_SSL_REDIRECT=0                        # optional, if the proxy already redirects
+```
+
+`python manage.py check --deploy` with those set should come back clean. The rest is
+outside Django:
+
 - Serve over HTTPS and remove `android:usesCleartextTraffic` from the Android manifest.
 - Hand `/media/` (payment receipts) to the web server or object storage; Django only serves
   it while `DEBUG` is on, and the files are not access-checked, so keep the paths unguessable.
 - Install a TrueType font carrying the naira sign (`fonts-dejavu-core` on Debian and
   Ubuntu), or every PDF will read `NGN` where it should read `₦`.
-- Move off SQLite if more than one hospital will be writing at once.
+- Move off SQLite to MySQL if more than one hospital will be writing at once (`pip install
+  mysqlclient`, then swap `DATABASES['default']` for the `django.db.backends.mysql` engine).
 "# PPP" 
