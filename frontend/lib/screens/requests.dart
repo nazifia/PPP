@@ -568,7 +568,10 @@ class _RequestDetailScreenState extends State<RequestDetailScreen> {
                               builder: (_) => _AddLineDialog(
                                 requisitionId: data['id'] as int,
                                 supplierId: data['supplier'] as int,
-                                onRequest: {for (final line in lines) line['product'] as int},
+                                onRequest: {
+                                  for (final line in lines)
+                                    line['product'] as int: qty(line['qty_requested']),
+                                },
                               ),
                             );
                             if (added == true) reload();
@@ -871,8 +874,8 @@ class _RequestDetailScreenState extends State<RequestDetailScreen> {
 
 /// Adds a line to a draft straight from the company's catalogue, so a request
 /// can be finished where it is read instead of going back round the catalogue
-/// screen. Items already on the request are left out: their quantity is edited
-/// on the row itself.
+/// screen. An item already on the request is still listed, showing what is on
+/// it, since adding it again tops that line up.
 class _AddLineDialog extends StatefulWidget {
   const _AddLineDialog({
     required this.requisitionId,
@@ -882,7 +885,9 @@ class _AddLineDialog extends StatefulWidget {
 
   final int requisitionId;
   final int supplierId;
-  final Set<int> onRequest;
+
+  /// Quantity already asked for, by product id.
+  final Map<int, double> onRequest;
 
   @override
   State<_AddLineDialog> createState() => _AddLineDialogState();
@@ -902,9 +907,13 @@ class _AddLineDialogState extends State<_AddLineDialog> {
   bool _hasNext = false;
   bool _loadingMore = false;
 
-  /// Products added during this visit, so the row leaves the picker without a
-  /// refetch and the caller knows whether the request changed.
-  final _added = <int>{};
+  /// What each line holds, topped up as items are added here, so the picker
+  /// reads right without refetching the request.
+  late final Map<int, double> _onRequest = {...widget.onRequest};
+
+  /// Whether anything was added during this visit, so the caller knows whether
+  /// the request changed.
+  bool _added = false;
   int? _busy;
 
   @override
@@ -967,14 +976,12 @@ class _AddLineDialogState extends State<_AddLineDialog> {
                 controller: _controller,
                 load: _loadFirstPage,
                 builder: (context, firstPage, reload) {
-                  final items = [
-                    for (final item in [...firstPage, ..._extraRows])
-                      if (!widget.onRequest.contains(item['id']) && !_added.contains(item['id']))
-                        item,
-                  ];
+                  // An item already on the request stays in the picker: adding
+                  // it again tops the line up rather than duplicating it.
+                  final items = [...firstPage, ..._extraRows];
                   if (items.isEmpty && !_hasNext) {
                     return const EmptyState(
-                      'Nothing left to add from this company.',
+                      'Nothing to add from this company.',
                       icon: Icons.medication_outlined,
                     );
                   }
@@ -1005,7 +1012,7 @@ class _AddLineDialogState extends State<_AddLineDialog> {
       ),
       actions: [
         TextButton(
-          onPressed: () => Navigator.pop(context, _added.isNotEmpty),
+          onPressed: () => Navigator.pop(context, _added),
           child: const Text('Close'),
         ),
       ],
@@ -1015,6 +1022,7 @@ class _AddLineDialogState extends State<_AddLineDialog> {
   Widget _itemRow(Map<String, dynamic> item) {
     final id = item['id'] as int;
     final quantity = _quantities.putIfAbsent(id, () => TextEditingController(text: '1'));
+    final onRequest = _onRequest[id];
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
       child: Row(
@@ -1029,6 +1037,7 @@ class _AddLineDialogState extends State<_AddLineDialog> {
                     if ('${item['brand']}'.isNotEmpty) item['brand'],
                     '${amount(item['unit_price'])} / ${item['unit']}',
                     'available ${qtyText(item['available_qty'] ?? item['stock_qty'])}',
+                    if (onRequest != null) 'on request ${qtyText(onRequest)}',
                   ].join(' · '),
                   style: Theme.of(context).textTheme.labelSmall?.copyWith(
                     color: Theme.of(context).colorScheme.onSurfaceVariant,
@@ -1049,7 +1058,7 @@ class _AddLineDialogState extends State<_AddLineDialog> {
             ),
           ),
           IconButton(
-            tooltip: 'Add to request',
+            tooltip: onRequest == null ? 'Add to request' : 'Add more to request',
             icon: const Icon(Icons.add_shopping_cart),
             onPressed: _busy == null ? () => _add(item) : null,
           ),
@@ -1073,7 +1082,11 @@ class _AddLineDialogState extends State<_AddLineDialog> {
         'qty_requested': wanted,
       });
       if (!mounted) return;
-      setState(() => _added.add(id));
+      // Mirrors the server, which adds to the line rather than replacing it.
+      setState(() {
+        _onRequest[id] = (_onRequest[id] ?? 0) + wanted;
+        _added = true;
+      });
       showDone(context, 'Added ${product['generic_name']}.');
     } catch (error) {
       if (mounted) showError(context, error);
