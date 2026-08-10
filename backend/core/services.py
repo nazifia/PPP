@@ -97,6 +97,42 @@ def dispense(user, product, qty, note=''):
     return movement
 
 
+@transaction.atomic
+def adjust(user, product, qty, reason):
+    """A hospital corrects its own ledger. Signed: negative writes stock off.
+
+    Dispensing is the only other way goods leave a hospital, and it means a ward
+    used them. Everything else that takes something off the shelf — a drug past
+    its date, a broken vial, a theft, a count that never matched the book — has
+    no other way out, and without one the ledger drifts away from the shelf and
+    never comes back. The supplier's half of this is `restock` on the catalogue.
+    """
+    require_hospital(user)
+    if not user.is_org_admin:
+        raise PermissionDenied('Only an organisation administrator can adjust the ledger.')
+    if qty == 0:
+        raise ValidationError('An adjustment of zero changes nothing.')
+    if not (reason or '').strip():
+        raise ValidationError('Say why the ledger is being adjusted.')
+
+    # Same lock as a dispense, for the same reason: two adjustments must not
+    # both read the balance before either has written.
+    Product.objects.select_for_update().get(pk=product.pk)
+    held = stock_balance(user.scope_org, product)
+    if held + qty < 0:
+        raise ValidationError(f'{product}: only {held} in stock, so {qty} would go below zero.')
+
+    movement = StockMovement.objects.create(
+        organization=user.scope_org, product=product,
+        kind=StockMovement.ADJUST, qty=qty, note=reason.strip(),
+    )
+    audit(
+        user, 'StockMovement', movement.pk, 'ADJUSTED',
+        product=str(product), qty=qty, reason=reason.strip(),
+    )
+    return movement
+
+
 def require_partner(hospital, supplier):
     linked = Partnership.objects.filter(
         hospital=hospital, supplier=supplier, is_active=True,
@@ -232,7 +268,12 @@ def dispatch(requisition, user, items, waybill_no=''):
     if not items:
         raise ValidationError('Nothing to dispatch.')
 
-    lines = {line.id: line for line in requisition.lines.select_related('product')}
+    # qty_supplied on each line adds up its delivery lines, so they come along
+    # rather than costing a query apiece.
+    lines = {
+        line.id: line
+        for line in requisition.lines.select_related('product').prefetch_related('delivery_lines')
+    }
     delivery = Delivery.objects.create(
         requisition=requisition, dispatched_by=user, waybill_no=waybill_no,
     )
@@ -323,11 +364,15 @@ def verify(delivery, user, results, remark=''):
         product = Product.objects.select_for_update().get(
             pk=line.requisition_line.product_id,
         )
+        # The batch and its expiry date travel with the goods onto whichever
+        # ledger they land on. Without this they stop at the delivery note, and
+        # the hospital holds no record of what expires when.
+        batch = {'batch_no': line.batch_no, 'expiry_date': line.expiry_date}
         if accepted:
             StockMovement.objects.create(
                 organization=requisition.hospital, product=product,
                 kind=StockMovement.RECEIPT, qty=accepted, delivery=delivery,
-                note=f'Receipt {delivery.reference}',
+                note=f'Receipt {delivery.reference}', **batch,
             )
         if rejected:
             # Back on the shelf, but still owed on this request, so still reserved.
@@ -337,7 +382,7 @@ def verify(delivery, user, results, remark=''):
             StockMovement.objects.create(
                 organization=requisition.supplier, product=product,
                 kind=StockMovement.RETURN, qty=rejected, delivery=delivery,
-                note=line.reject_reason,
+                note=line.reject_reason, **batch,
             )
         accepted_total += accepted
         amount += line.requisition_line.unit_price * accepted
@@ -357,8 +402,11 @@ def verify(delivery, user, results, remark=''):
             supplier=requisition.supplier, amount=_money(amount),
         )
 
+    # Read after the saves above, and with the delivery lines in hand: qty_accepted
+    # adds them up, which is a query per line without the prefetch.
     settled = all(
-        line.qty_accepted >= line.qty_approved for line in requisition.lines.all()
+        line.qty_accepted >= line.qty_approved
+        for line in requisition.lines.prefetch_related('delivery_lines')
     )
     requisition.status = ReqStatus.CLOSED if settled else ReqStatus.DELIVERED
     requisition.closed_at = timezone.now() if settled else None
@@ -391,7 +439,8 @@ def release(requisition, user, reason=''):
     if not reason.strip():
         raise ValidationError('Say why the approved quantity is being released.')
 
-    lines = list(requisition.lines.select_related('product'))
+    # qty_supplied and qty_accepted below both add up the delivery lines.
+    lines = list(requisition.lines.select_related('product').prefetch_related('delivery_lines'))
     products = {
         product.id: product
         for product in Product.objects.select_for_update().filter(

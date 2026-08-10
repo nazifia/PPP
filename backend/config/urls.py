@@ -14,8 +14,6 @@ Including another URLconf
     1. Import the include() function: from django.urls import include, path
     2. Add a URL to urlpatterns:  path('blog/', include('blog.urls'))
 """
-from django.conf import settings
-from django.conf.urls.static import static
 from django.contrib import admin
 from django.urls import include, path
 
@@ -36,6 +34,6 @@ urlpatterns = [
     path('print/<str:kind>/', printing.document, name='print-ledger'),
 ]
 
-# ponytail: dev-only media serving; put /media/ behind the web server in production.
-if settings.DEBUG:
-    urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
+# No /media/ route in either mode. The only uploaded file is a payment receipt,
+# and it is served by GET /api/payments/{id}/receipt/, which checks who is
+# asking. Serving MEDIA_ROOT by path would hand the same file to anyone at all.

@@ -9,9 +9,12 @@ from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
 
+from django.core.cache import cache
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.core.management import call_command
+from django.db import connection
 from django.test import TestCase, override_settings
+from django.test.utils import CaptureQueriesContext
 from django.urls import reverse
 from django.utils import timezone
 from pypdf import PdfReader
@@ -19,6 +22,7 @@ from rest_framework.authtoken.models import Token
 from rest_framework.test import APITestCase
 
 from .models import (
+    Delivery,
     Department,
     DispensingUnit,
     Invoice,
@@ -41,6 +45,11 @@ from .models import (
 
 class SupplyFlowTests(APITestCase):
     def setUp(self):
+        # The login throttle counts attempts in the cache, which no test client
+        # resets. A test that signs four people in is not an attack, and without
+        # this the count carries into the next test. LoginThrottleTests below is
+        # where the rate itself is checked.
+        cache.clear()
         self.hospital = Organization.objects.create(
             name='General Hospital', kind=OrgKind.HOSPITAL, phone='08000000001',
         )
@@ -499,16 +508,38 @@ class SupplyFlowTests(APITestCase):
             format='multipart',
         )
         self.assertEqual(response.status_code, 201, response.data)
-        self.assertIn('.jpg', response.data['receipt'])
 
         payment = Payment.objects.get(pk=response.data['id'])
         self.assertTrue(payment.receipt.name.startswith('receipts/'))
+        # The slip is offered as a route through the API, not as a path in
+        # MEDIA_ROOT: the one asks who is calling, the other does not.
+        self.assertTrue(response.data['receipt'].endswith(f'/api/payments/{payment.pk}/receipt/'))
+
+        # The hospital that filed it reads it back. Closed rather than left to
+        # the garbage collector: Windows will not delete a file still held open.
+        fetched = self.client.get(f'/api/payments/{payment.pk}/receipt/')
+        self.addCleanup(fetched.close)
+        self.assertEqual(fetched.status_code, 200)
+        self.assertEqual(b''.join(fetched.streaming_content), b'jpegbytes')
 
         # The company sees the slip it has to check.
         self.login('08022222222')
         listed = self.client.get('/api/payments/').data['results']
         self.assertEqual(len(listed), 1)
-        self.assertIn('.jpg', listed[0]['receipt'])
+        supplier_copy = self.client.get(f'/api/payments/{payment.pk}/receipt/')
+        self.addCleanup(supplier_copy.close)
+        self.assertEqual(supplier_copy.status_code, 200)
+
+        # Nobody else does, even holding the payment's id.
+        rival = Organization.objects.create(
+            name='Rival Clinic', kind=OrgKind.HOSPITAL, phone='08099999999',
+        )
+        User.objects.create_user(
+            phone='08088888888', password='Sup3rSecret!', full_name='Rival Admin',
+            organization=rival, role=Role.ADMIN,
+        )
+        self.login('08088888888')
+        self.assertEqual(self.client.get(f'/api/payments/{payment.pk}/receipt/').status_code, 404)
 
     def test_a_stranger_cannot_see_or_decide_another_tenants_payments(self):
         invoice = self.raise_invoice(qty=10)
@@ -885,6 +916,173 @@ class SupplyFlowTests(APITestCase):
             400,
         )
         self.assertEqual(self.client.get(balances).data[0]['balance'], 7)
+
+    def test_hospital_writes_stock_off_and_puts_a_miscount_right(self):
+        StockMovement.objects.create(
+            organization=self.hospital, product=self.product,
+            kind=StockMovement.RECEIPT, qty=20,
+        )
+        self.login('08011111111')
+        url = reverse('stock-movement-adjust')
+        balances = reverse('stock-movement-balances')
+
+        # Six vials found broken in the store: off the books, with a reason.
+        written_off = self.client.post(
+            url,
+            {'product': self.product.pk, 'qty': -6, 'reason': 'Broken in the store'},
+            format='json',
+        )
+        self.assertEqual(written_off.status_code, 201, written_off.data)
+        self.assertEqual(written_off.data['qty'], -6)
+        self.assertEqual(written_off.data['kind'], StockMovement.ADJUST)
+        self.assertEqual(self.client.get(balances).data[0]['balance'], 14)
+
+        # A recount the other way is the same endpoint.
+        self.client.post(
+            url, {'product': self.product.pk, 'qty': 2, 'reason': 'Recount'}, format='json',
+        )
+        self.assertEqual(self.client.get(balances).data[0]['balance'], 16)
+
+        # Never past zero, never silent, never nothing at all. A reason of
+        # nothing but spaces is trimmed to blank and refused by the field, which
+        # is why the service's own check for it never has to answer here.
+        for payload, expected in (
+            ({'qty': -20, 'reason': 'Too much'}, 'only 16 in stock'),
+            ({'qty': -1, 'reason': '  '}, 'may not be blank'),
+            ({'qty': 0, 'reason': 'Nothing'}, 'changes nothing'),
+        ):
+            response = self.client.post(
+                url, {'product': self.product.pk, **payload}, format='json',
+            )
+            self.assertEqual(response.status_code, 400, response.data)
+            self.assertIn(expected, str(response.data))
+        self.assertEqual(self.client.get(balances).data[0]['balance'], 16)
+
+        # It is an administrator's signature, like every other correction.
+        staff = User.objects.create_user(
+            phone='08033333333', password='Sup3rSecret!', full_name='Ward Staff',
+            organization=self.hospital, role=Role.STAFF,
+        )
+        self.client.force_authenticate(staff)
+        self.assertEqual(
+            self.client.post(
+                url, {'product': self.product.pk, 'qty': -1, 'reason': 'Mine now'},
+                format='json',
+            ).status_code,
+            403,
+        )
+
+    def test_a_batch_and_its_expiry_date_follow_the_goods_onto_the_ledger(self):
+        expires = timezone.localdate() + timedelta(days=30)
+        self.login('08011111111')
+        requisition = self.client.post(
+            '/api/requisitions/', {'supplier': self.supplier.pk}, format='json',
+        ).data
+        self.client.post(
+            '/api/requisition-lines/',
+            {'requisition': requisition['id'], 'product': self.product.pk, 'qty_requested': 10},
+            format='json',
+        )
+        self.client.post(f"/api/requisitions/{requisition['id']}/submit/")
+
+        self.login('08022222222')
+        line = self.client.get(f"/api/requisitions/{requisition['id']}/").data['lines'][0]
+        self.client.post(
+            f"/api/requisitions/{requisition['id']}/decide/",
+            {'lines': [{'line': line['id'], 'qty_approved': 10}]}, format='json',
+        )
+        delivery = self.client.post(
+            f"/api/requisitions/{requisition['id']}/dispatch/",
+            {
+                'items': [{
+                    'line': line['id'], 'qty': 10,
+                    'batch_no': 'BATCH-77', 'expiry_date': expires.isoformat(),
+                }],
+            },
+            format='json',
+        ).data
+
+        self.login('08011111111')
+        self.client.post(
+            f"/api/deliveries/{delivery['id']}/verify/",
+            {'lines': [{'line': delivery['lines'][0]['id'], 'qty_accepted': 10}]},
+            format='json',
+        )
+
+        # The receipt on the hospital's ledger carries what the crate was marked with.
+        receipt = StockMovement.objects.get(
+            organization=self.hospital, kind=StockMovement.RECEIPT,
+        )
+        self.assertEqual(receipt.batch_no, 'BATCH-77')
+        self.assertEqual(receipt.expiry_date, expires)
+
+        # And the shelf check finds it, inside the window and not outside it.
+        url = reverse('stock-movement-expiring')
+        soon = self.client.get(url, {'days': 90}).data
+        self.assertEqual(soon['count'], 1)
+        self.assertEqual(soon['results'][0]['batch_no'], 'BATCH-77')
+        self.assertEqual(self.client.get(url, {'days': 7}).data['count'], 0)
+        # Default window, and a nonsense one falls back to it rather than failing.
+        self.assertEqual(self.client.get(url).data['count'], 1)
+        self.assertEqual(self.client.get(url, {'days': 'soon'}).data['count'], 1)
+
+    def test_low_stock_answers_to_each_items_own_reorder_level(self):
+        # 100 in stock: low for the item that wants 150 on the shelf, and fine
+        # for the one that wants 20, which the flat figure could never tell apart.
+        self.product.reorder_level = 150
+        self.product.save(update_fields=['reorder_level'])
+        comfortable = Product.objects.create(
+            supplier=self.supplier, generic_name='Paracetamol', unit=self.carton,
+            unit_price='100.00', stock_qty=100, reorder_level=20,
+        )
+        # Named nothing, so it falls back to the platform figure — and 4 is under it.
+        silent = Product.objects.create(
+            supplier=self.supplier, generic_name='Adrenaline', unit=self.carton,
+            unit_price='500.00', stock_qty=4,
+        )
+
+        self.login('08022222222')
+        low = {row['generic_name'] for row in self.client.get('/api/dashboard/').data['low_stock']}
+        self.assertEqual(low, {'10% Dextrose Water', 'Adrenaline'})
+        self.assertNotIn(comfortable.generic_name, low)
+
+        # Reserved stock is promised elsewhere, so it does not count as available.
+        comfortable.qty_reserved = 85
+        comfortable.save(update_fields=['qty_reserved'])
+        self.assertIn(
+            'Paracetamol',
+            {row['generic_name'] for row in self.client.get('/api/dashboard/').data['low_stock']},
+        )
+        self.assertTrue(Product.objects.get(pk=silent.pk).is_low_stock)
+
+    def test_the_catalogue_refuses_a_unit_from_another_department(self):
+        laboratory = Department.objects.create(organization=self.hospital, name='LABORATORY')
+        theatre = Department.objects.create(organization=self.hospital, name='THEATRE')
+        haematology = Unit.objects.create(department=laboratory, name='HAEMATOLOGY')
+
+        self.login('08011111111')
+        clash = self.client.post(
+            '/api/requisitions/wishlist/add/',
+            {
+                'product': self.product.pk, 'qty': 1,
+                'department': theatre.pk, 'unit': haematology.pk,
+            },
+            format='json',
+        )
+        self.assertEqual(clash.status_code, 400, clash.data)
+        self.assertIn('different department', str(clash.data))
+        self.assertFalse(Requisition.objects.exists())
+
+        # The pair that agrees is taken.
+        agreed = self.client.post(
+            '/api/requisitions/wishlist/add/',
+            {
+                'product': self.product.pk, 'qty': 1,
+                'department': laboratory.pk, 'unit': haematology.pk,
+            },
+            format='json',
+        )
+        self.assertEqual(agreed.status_code, 201, agreed.data)
 
     def test_supplier_cannot_dispense(self):
         self.login('08022222222')
@@ -1993,6 +2191,101 @@ class SupplyFlowTests(APITestCase):
             ).status_code,
             404,
         )
+
+
+class ListQueryCountTests(APITestCase):
+    """An index page must not ask one more question per row it shows.
+
+    requested_value, approved_value and item_count each walk a requisition's
+    lines, and amount_pending walks an invoice's payments — so without the
+    prefetches in the viewsets these lists cost a query per row and nobody
+    notices until a real tenant has a few hundred of them.
+    """
+
+    def setUp(self):
+        cache.clear()
+        self.hospital = Organization.objects.create(
+            name='General Hospital', kind=OrgKind.HOSPITAL, phone='08000000001',
+        )
+        self.supplier = Organization.objects.create(
+            name='Valour Pharmaceuticals', kind=OrgKind.SUPPLIER, phone='08000000002',
+        )
+        Partnership.objects.create(hospital=self.hospital, supplier=self.supplier)
+        self.admin = User.objects.create_user(
+            phone='08011111111', password='Sup3rSecret!', full_name='Hospital Admin',
+            organization=self.hospital, role=Role.ADMIN,
+        )
+        self.product = Product.objects.create(
+            supplier=self.supplier, generic_name='10% Dextrose Water',
+            unit=DispensingUnit.objects.get(supplier=None, name='CARTON'),
+            unit_price='720.00', stock_qty=1000,
+        )
+        self.client.force_authenticate(self.admin)
+
+    def make_requisitions(self, count):
+        for _ in range(count):
+            requisition = Requisition.objects.create(
+                hospital=self.hospital, supplier=self.supplier, status=ReqStatus.SUBMITTED,
+            )
+            requisition.lines.create(
+                product=self.product, qty_requested=2, unit_price='720.00',
+            )
+
+    def make_invoices(self, count):
+        for _ in range(count):
+            requisition = Requisition.objects.create(
+                hospital=self.hospital, supplier=self.supplier, status=ReqStatus.DELIVERED,
+            )
+            invoice = Invoice.objects.create(
+                delivery=Delivery.objects.create(requisition=requisition),
+                hospital=self.hospital, supplier=self.supplier, amount='720.00',
+            )
+            Payment.objects.create(invoice=invoice, amount='100.00', method=PaymentMethod.CASH)
+
+    def assert_flat(self, url, add_rows):
+        """One row and ten rows must cost the same number of queries."""
+        add_rows(1)
+        with CaptureQueriesContext(connection) as first:
+            self.client.get(url)
+        add_rows(9)
+        with self.assertNumQueries(len(first)):
+            response = self.client.get(url)
+        self.assertEqual(len(response.data['results']), 10)
+
+    def test_the_requisition_list_costs_the_same_for_one_row_or_many(self):
+        self.assert_flat('/api/requisitions/', self.make_requisitions)
+
+    def test_the_invoice_list_costs_the_same_for_one_row_or_many(self):
+        self.assert_flat('/api/invoices/', self.make_invoices)
+
+
+class LoginThrottleTests(APITestCase):
+    """Guessing at a phone number and a password is rationed."""
+
+    def setUp(self):
+        cache.clear()
+        self.addCleanup(cache.clear)
+        User.objects.create_user(
+            phone='08011111111', password='Sup3rSecret!', full_name='Hospital Admin',
+        )
+
+    def attempt(self, password):
+        return self.client.post(
+            reverse('login'), {'phone': '08011111111', 'password': password}, format='json',
+        ).status_code
+
+    def test_a_run_of_guesses_is_cut_off(self):
+        # Ten a minute: wrong ones are answered 400 and still counted, or a
+        # guesser would get an unlimited run of them.
+        for _ in range(10):
+            self.assertEqual(self.attempt('wrong'), 400)
+        self.assertEqual(self.attempt('wrong'), 429)
+        # The right password is refused too — the door is shut, not the guess.
+        self.assertEqual(self.attempt('Sup3rSecret!'), 429)
+
+    def test_signing_in_normally_is_never_throttled(self):
+        for _ in range(5):
+            self.assertEqual(self.attempt('Sup3rSecret!'), 200)
 
 
 class RuntimeModeTests(TestCase):

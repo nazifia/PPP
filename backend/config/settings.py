@@ -108,6 +108,14 @@ REST_FRAMEWORK = {
     ],
     'DEFAULT_PAGINATION_CLASS': 'rest_framework.pagination.PageNumberPagination',
     'PAGE_SIZE': 25,
+    # Only the two doors an unauthenticated caller can knock on are throttled,
+    # by the scope each view names. Everything else is behind a token already.
+    'DEFAULT_THROTTLE_CLASSES': ['rest_framework.throttling.ScopedRateThrottle'],
+    'DEFAULT_THROTTLE_RATES': {
+        # A ward phone gets its password wrong a few times; a script does not.
+        'login': '10/min',
+        'register': '5/hour',
+    },
 }
 
 MIDDLEWARE = [
@@ -148,10 +156,24 @@ WSGI_APPLICATION = 'config.wsgi.application'
 # concurrency. Point DJANGO_DB_PATH at a volume that survives redeploys; move to
 # MySQL (needs mysqlclient, not in requirements.txt yet) when concurrent writers
 # start hitting "database is locked".
+#
+# SQLite has no SELECT ... FOR UPDATE, and Django drops the clause silently
+# rather than refusing it, so every select_for_update() in core/services.py is a
+# no-op here: two approvals could read the same free stock and both reserve the
+# last carton. IMMEDIATE takes the write lock when the transaction opens instead
+# of at its first write, which serialises the whole of each @transaction.atomic
+# block and makes those locks mean what their comments say. WAL lets readers
+# carry on while one writer holds it.
 DATABASES = {
     'default': {
         'ENGINE': 'django.db.backends.sqlite3',
         'NAME': os.environ.get('DJANGO_DB_PATH') or BASE_DIR / 'db.sqlite3',
+        'OPTIONS': {
+            'transaction_mode': 'IMMEDIATE',
+            # Waiting is what a lock is for; failing straight away is not.
+            'timeout': 20,
+            'init_command': 'PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;',
+        },
     }
 }
 
@@ -180,7 +202,11 @@ AUTH_PASSWORD_VALIDATORS = [
 
 LANGUAGE_CODE = 'en-us'
 
-TIME_ZONE = 'UTC'
+# Stamps are stored in UTC (USE_TZ), but every date the domain decides — an
+# invoice due date, which month a request counts under, the day a ledger row
+# falls on — is worked out with timezone.localdate(). On UTC that puts anything
+# recorded after 11pm Lagos time on the day before.
+TIME_ZONE = 'Africa/Lagos'
 
 USE_I18N = True
 
@@ -199,12 +225,24 @@ MEDIA_URL = 'media/'
 MEDIA_ROOT = BASE_DIR / 'media'
 
 
-# Email
-# https://docs.djangoproject.com/en/6.1/topics/email/#topic-email-configuration
-
-MAILERS = {
-    'default': {
-        'BACKEND': 'django.core.mail.backends.console.EmailBackend',
+# Logging
+#
+# Django's own default prints a request's traceback only while DEBUG is on; with
+# it off the same traceback is mailed to ADMINS, which here is nobody, so a 500
+# in production goes nowhere at all. stderr instead — systemd, docker and every
+# platform host is already collecting it.
+LOGGING = {
+    'version': 1,
+    'disable_existing_loggers': False,
+    'formatters': {
+        'plain': {'format': '{asctime} {levelname} {name} {message}', 'style': '{'},
+    },
+    'handlers': {
+        'console': {'class': 'logging.StreamHandler', 'formatter': 'plain'},
+    },
+    'root': {'handlers': ['console'], 'level': 'INFO'},
+    'loggers': {
+        'django.request': {'handlers': ['console'], 'level': 'ERROR', 'propagate': False},
     },
 }
 

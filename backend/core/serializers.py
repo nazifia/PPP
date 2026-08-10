@@ -5,6 +5,7 @@ from django.contrib.auth.password_validation import validate_password
 from django.core.validators import FileExtensionValidator
 from django.db import transaction
 from django.db.models import Q
+from django.urls import reverse
 from rest_framework import serializers
 
 from .models import (
@@ -344,6 +345,8 @@ class ProductSerializer(serializers.ModelSerializer):
     stock_qty = QuantityField(min_value=Decimal('0'), required=False)
     qty_reserved = QuantityField(read_only=True)
     max_order_qty = QuantityField(min_value=HALF_UNIT, required=False, allow_null=True)
+    reorder_level = QuantityField(min_value=Decimal('0'), required=False, allow_null=True)
+    is_low_stock = serializers.BooleanField(read_only=True)
 
     class Meta:
         model = Product
@@ -351,7 +354,7 @@ class ProductSerializer(serializers.ModelSerializer):
             'id', 'supplier', 'supplier_name', 'generic_name', 'brand', 'strength',
             'formulation', 'formulation_name', 'unit', 'unit_name', 'unit_price',
             'stock_qty', 'qty_reserved', 'available_qty', 'max_order_qty',
-            'is_active', 'availability', 'updated_at',
+            'reorder_level', 'is_low_stock', 'is_active', 'availability', 'updated_at',
         ]
         read_only_fields = ['supplier', 'qty_reserved']
 
@@ -371,6 +374,18 @@ class ProductSerializer(serializers.ModelSerializer):
 
     def validate_formulation(self, value):
         return value if value is None else self._check_own(value)
+
+
+def check_unit_in_department(department, unit):
+    """A request carries one tag or the other, and they must not disagree.
+
+    Shared by the detail screen and the catalogue's add button, which both build
+    the same pair and would otherwise only agree by coincidence.
+    """
+    if unit and department and unit.department_id != department.pk:
+        raise serializers.ValidationError(
+            {'unit': 'That unit belongs to a different department.'},
+        )
 
 
 class RequisitionLineSerializer(serializers.ModelSerializer):
@@ -461,12 +476,10 @@ class RequisitionSerializer(serializers.ModelSerializer):
 
     def validate(self, attrs):
         instance = self.instance
-        unit = attrs.get('unit', getattr(instance, 'unit', None))
-        department = attrs.get('department', getattr(instance, 'department', None))
-        if unit and department and unit.department_id != department.pk:
-            raise serializers.ValidationError(
-                {'unit': 'That unit belongs to a different department.'},
-            )
+        check_unit_in_department(
+            attrs.get('department', getattr(instance, 'department', None)),
+            attrs.get('unit', getattr(instance, 'unit', None)),
+        )
         return attrs
 
 
@@ -488,6 +501,13 @@ class WishlistAddSerializer(serializers.Serializer):
     unit = serializers.PrimaryKeyRelatedField(
         queryset=Unit.objects.all(), required=False, allow_null=True,
     )
+
+    def validate(self, attrs):
+        # The same pair the detail screen refuses. Without it the catalogue can
+        # open a draft tagged with two departments at once, which nothing else
+        # would then let anybody edit.
+        check_unit_in_department(attrs.get('department'), attrs.get('unit'))
+        return attrs
 
 
 class DecisionSerializer(serializers.Serializer):
@@ -560,6 +580,7 @@ class PaymentSerializer(serializers.ModelSerializer):
     method_display = serializers.CharField(source='get_method_display', read_only=True)
     recorded_by_name = serializers.CharField(source='recorded_by.full_name', read_only=True)
     decided_by_name = serializers.CharField(source='decided_by.full_name', read_only=True)
+    receipt = serializers.SerializerMethodField()
 
     class Meta:
         model = Payment
@@ -570,6 +591,18 @@ class PaymentSerializer(serializers.ModelSerializer):
             'recorded_at', 'decided_by', 'decided_by_name', 'decided_at', 'reject_reason',
         ]
         read_only_fields = fields
+
+    def get_receipt(self, payment):
+        """Where to ask for the slip, rather than where it sits on disk.
+
+        The route goes back through the payment viewset, which knows whose
+        payment this is; a MEDIA_URL path is readable by anyone who has it.
+        """
+        if not payment.receipt:
+            return None
+        url = reverse('payment-receipt', args=[payment.pk])
+        request = self.context.get('request')
+        return request.build_absolute_uri(url) if request else url
 
 
 class InvoiceDetailSerializer(InvoiceSerializer):
@@ -619,6 +652,15 @@ class DispenseSerializer(serializers.Serializer):
     note = serializers.CharField(max_length=255, required=False, allow_blank=True, default='')
 
 
+class AdjustSerializer(serializers.Serializer):
+    """A correction to the hospital's own ledger. Signed, and always explained."""
+
+    product = serializers.PrimaryKeyRelatedField(queryset=Product.objects.all())
+    # No minimum: writing stock off is the whole point, and that is a negative.
+    qty = QuantityField()
+    reason = serializers.CharField(max_length=255)
+
+
 class StockMovementSerializer(serializers.ModelSerializer):
     product_name = serializers.CharField(source='product.__str__', read_only=True)
     delivery_reference = serializers.CharField(source='delivery.reference', read_only=True)
@@ -630,7 +672,8 @@ class StockMovementSerializer(serializers.ModelSerializer):
         model = StockMovement
         fields = [
             'id', 'product', 'product_name', 'organization_name', 'kind', 'qty',
-            'delivery', 'delivery_reference', 'note', 'created_at',
+            'delivery', 'delivery_reference', 'batch_no', 'expiry_date', 'note',
+            'created_at',
         ]
 
 

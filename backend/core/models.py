@@ -37,6 +37,11 @@ def new_reference():
 HALF_UNIT = Decimal('0.5')
 QTY_DECIMAL_PLACES = 1
 
+#: What counts as low stock for an item that names no reorder level of its own.
+#: Ten cartons of gauze and ten vials of adrenaline are not the same alarm, which
+#: is what Product.reorder_level is for; this is only the fallback.
+DEFAULT_REORDER_LEVEL = Decimal('10')
+
 
 def quantity_field(**kwargs):
     """A quantity column: decimal, because half units are dispensed and sold."""
@@ -360,6 +365,14 @@ class Product(models.Model):
     max_order_qty = quantity_field(
         null=True, blank=True, help_text='Cap per single request. Blank = no cap.',
     )
+    reorder_level = quantity_field(
+        null=True, blank=True,
+        help_text=(
+            'Warn when the available quantity falls below this. Blank falls back '
+            'to the platform default, which is the same figure for everything and '
+            'so is rarely the right one for anything.'
+        ),
+    )
     is_active = models.BooleanField(default=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -374,6 +387,12 @@ class Product(models.Model):
     def available_qty(self):
         """On the shelf and not already promised to an approved request."""
         return max(self.stock_qty - self.qty_reserved, Decimal('0'))
+
+    @property
+    def is_low_stock(self):
+        return self.available_qty < (
+            self.reorder_level if self.reorder_level is not None else DEFAULT_REORDER_LEVEL
+        )
 
     @property
     def availability(self):
@@ -621,11 +640,21 @@ class Invoice(models.Model):
 
     @property
     def amount_pending(self):
-        """Declared by the hospital, not yet confirmed by the supplier."""
-        total = self.payments.filter(status=PaymentStatus.PENDING).aggregate(
-            total=models.Sum('amount'),
-        )['total']
-        return (total or Decimal('0.00')).quantize(Decimal('0.01'))
+        """Declared by the hospital, not yet confirmed by the supplier.
+
+        Filtered in Python rather than by the database, so a list that prefetched
+        its payments pays nothing here and reads them once for the whole page.
+        An invoice on its own still costs the one query it always did, and
+        `amount_unclaimed` below now shares it instead of asking again.
+        """
+        total = sum(
+            (
+                payment.amount for payment in self.payments.all()
+                if payment.status == PaymentStatus.PENDING
+            ),
+            Decimal('0.00'),
+        )
+        return total.quantize(Decimal('0.01'))
 
     @property
     def amount_unclaimed(self):
@@ -747,6 +776,11 @@ class StockMovement(models.Model):
     delivery = models.ForeignKey(
         Delivery, null=True, blank=True, on_delete=models.SET_NULL, related_name='movements',
     )
+    # Copied off the delivery line when goods are received, because otherwise the
+    # batch and its expiry date stop at the door: a hospital owns no catalogue
+    # row, so the ledger is the only place it could hold them.
+    batch_no = models.CharField(max_length=64, blank=True)
+    expiry_date = models.DateField(null=True, blank=True)
     note = models.CharField(max_length=255, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
@@ -754,6 +788,14 @@ class StockMovement(models.Model):
         # The id breaks the tie: one dispatch writes several rows in the same
         # instant, and a paged read needs a total order or rows shift between pages.
         ordering = ['-created_at', '-id']
+        indexes = [
+            # What the ledger is asked twice over: the running balance of one
+            # item (every dispense checks it), and the tenant's ledger by date.
+            models.Index(fields=['organization', 'product']),
+            models.Index(fields=['organization', '-created_at']),
+            # The shelf-check: what this tenant holds that is going out of date.
+            models.Index(fields=['organization', 'expiry_date']),
+        ]
 
 
 class AuditLog(models.Model):
@@ -773,7 +815,11 @@ class AuditLog(models.Model):
 
     class Meta:
         ordering = ['-created_at']
-        indexes = [models.Index(fields=['entity', 'entity_id'])]
+        indexes = [
+            models.Index(fields=['entity', 'entity_id']),
+            # How the trail is actually read: one tenant's, newest first.
+            models.Index(fields=['organization', '-created_at']),
+        ]
 
     def __str__(self):
         return f'{self.action} {self.entity}#{self.entity_id}'

@@ -99,6 +99,11 @@ DRAFT ──submit──▶ SUBMITTED ──decide──┬─▶ APPROVED ─�
    back out of the hospital's ledger. No approval: the item has already been used. A
    hospital owns no catalogue row, so its ledger is the only record of what it holds, and
    nothing may be dispensed beyond what that ledger adds up to.
+8. **Write off.** Dispensing means a ward used the goods. Everything else that takes
+   something off the shelf — a drug past its date, a broken vial, a count that never
+   matched the book — is `POST /stock-movements/adjust/`: a signed quantity and a reason,
+   from a hospital administrator. Without it the ledger drifts away from the shelf and
+   never comes back. The supplier's half of this is `POST /products/{id}/restock/`.
 
 If a company approves something and then cannot ship it, a company administrator posts
 `POST /requisitions/{id}/release/`
@@ -117,6 +122,27 @@ It puts every approval older than `--days` through the same release, acting as w
 decided the request, so the audit trail reads the same as a manual one.
 
 Every state change is written to an append-only `AuditLog`.
+
+## Batches, expiry and reorder levels
+
+A dispatch is marked with a batch number and an expiry date, and both now travel with
+the goods onto whichever ledger they land on — the hospital's when a line is accepted,
+the supplier's when it is rejected and goes back. A hospital owns no catalogue row, so
+the ledger is the only place it could hold them.
+
+```
+GET /stock-movements/expiring/?days=90    # soonest first, already-expired included
+```
+
+Receipts rather than balances: a dispense names no batch, so the ledger cannot say how
+much of one particular batch is left. This is the shelf-check list — what came in and
+when it goes out of date — and the pharmacist counts the rest.
+
+Each catalogue item carries its own `reorder_level`, and the dashboard's low-stock tile
+answers to that rather than to one figure for everything: ten cartons of gauze and ten
+vials of adrenaline are not the same alarm. An item that names none falls back to 10. The
+comparison is against the *available* quantity, not what is on the shelf, since stock
+already promised to an approved request cannot be sold to anybody else.
 
 ## Payments
 
@@ -163,8 +189,18 @@ or from the dashboard's overdue tile.
 A payment may carry a photo or scan of the teller slip, transfer advice or cheque: `jpg`,
 `jpeg`, `png`, `webp`, `heic` or `pdf`, up to 5 MB, posted as multipart on the same
 `pay/` endpoint. Files land in `MEDIA_ROOT` (`backend/media/`) under
-`receipts/<year>/<month>/<payment reference>`. Django serves them itself only while
-`DEBUG` is on.
+`receipts/<year>/<month>/<payment reference>`.
+
+Nothing serves `MEDIA_ROOT` by path. The slip comes back through the API instead, and
+the `receipt` field on a payment is that address rather than a file path:
+
+```
+GET /api/payments/{id}/receipt/   →  the image or PDF
+```
+
+It goes through the payment viewset, so the same rule that decides who may read a
+payment decides who may see its slip — the hospital that recorded it and the supplier
+being asked to confirm it, and nobody else.
 
 ## Printing
 
@@ -222,7 +258,7 @@ Everything lives under `/api/`. Authenticate with `Authorization: Token <key>`.
 | Endpoint | Purpose |
 |---|---|
 | `POST /auth/register/` | Public hospital sign-up (organisation + first admin) |
-| `POST /auth/login/` `POST /auth/logout/` | Phone + password session |
+| `POST /auth/login/` `POST /auth/logout/` | Phone + password session (10 attempts a minute per address; sign-up, 5 an hour) |
 | `GET/PATCH /auth/me/`, `POST /auth/change-password/` | Own account |
 | `GET/PATCH /organization/` | Own organisation profile |
 | `GET /dashboard/` | Counts, outstanding money, recent activity, and for a hospital what each department was invoiced |
@@ -235,8 +271,8 @@ Everything lives under `/api/`. Authenticate with `Authorization: Token <key>`.
 | `/requisition-lines/` | Line editing while the request is a draft |
 | `/deliveries/` | Consignments, plus `verify/` |
 | `/invoices/` | Invoices (`?status=`, `?overdue=true`), plus `pay/` (hospital records a payment) and `payments/` |
-| `/payments/` | Payment ledger (`?status=`, `?invoice=<id>`), plus `confirm/` and `reject/` (supplier) |
-| `/stock-movements/` | Stock ledger (`?product=<id>`, `?kind=`, `?from=`/`?to=` as inclusive dates), plus `balances/` for the per-item totals and `dispense/` (hospital records what it handed out) |
+| `/payments/` | Payment ledger (`?status=`, `?invoice=<id>`), plus `confirm/` and `reject/` (supplier) and `receipt/` for the attached slip |
+| `/stock-movements/` | Stock ledger (`?product=<id>`, `?kind=`, `?from=`/`?to=` as inclusive dates), plus `balances/` for the per-item totals, `dispense/` (hospital records what it handed out), `adjust/` (hospital writes stock off) and `expiring/?days=90` (the shelf check) |
 | `/audit-logs/` | Audit trail (administrators) |
 | `…/print/`, `…/print-link/` | The sheet as a PDF, and a signed ten-minute link to it for a browser — on a requisition, delivery, invoice or payment, and on the `/stock-movements/` and `/audit-logs/` lists (see Printing) |
 
@@ -276,10 +312,17 @@ in the environment wins over the file wherever it is set.
 outside Django:
 
 - Serve over HTTPS and remove `android:usesCleartextTraffic` from the Android manifest.
-- Hand `/media/` (payment receipts) to the web server or object storage; Django only serves
-  it while `DEBUG` is on, and the files are not access-checked, so keep the paths unguessable.
+- Give `MEDIA_ROOT` (payment receipts) a volume that survives a redeploy. Do *not* put it
+  behind a `/media/` route: the API serves those files itself and checks who is asking.
 - Install a TrueType font carrying the naira sign (`fonts-dejavu-core` on Debian and
   Ubuntu), or every PDF will read `NGN` where it should read `₦`.
+- The login and sign-up throttles count attempts in Django's cache, which defaults to
+  local memory — that is per worker process. Point `CACHES` at something shared (Redis,
+  Memcached) if you run more than one, or the rate is multiplied by however many there are.
 - Move off SQLite to MySQL if more than one hospital will be writing at once (`pip install
   mysqlclient`, then swap `DATABASES['default']` for the `django.db.backends.mysql` engine).
+  SQLite is opened `IMMEDIATE` with WAL on, which is what makes the `select_for_update()`
+  calls in `core/services.py` mean anything — SQLite has no row locks, and Django drops
+  the clause silently rather than refusing it, so without that the stock reservations
+  would be read-then-write races.
 "# PPP" 

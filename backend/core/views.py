@@ -1,8 +1,20 @@
 from datetime import date, timedelta
 from decimal import Decimal
+from pathlib import Path
 
-from django.db.models import BooleanField, Count, F, OuterRef, Q, Subquery, Sum, Value
+from django.db.models import (
+    BooleanField,
+    Count,
+    DecimalField,
+    F,
+    OuterRef,
+    Q,
+    Subquery,
+    Sum,
+    Value,
+)
 from django.db.models.functions import Coalesce, TruncMonth
+from django.http import FileResponse, Http404
 from django.utils import timezone
 from rest_framework import filters, mixins, status, viewsets
 from rest_framework.authtoken.models import Token
@@ -18,6 +30,7 @@ from rest_framework.views import APIView
 
 from . import services
 from .models import (
+    DEFAULT_REORDER_LEVEL,
     AuditLog,
     Delivery,
     Department,
@@ -42,6 +55,7 @@ from .models import (
 )
 from .printing import PrintListMixin, PrintMixin
 from .serializers import (
+    AdjustSerializer,
     AuditLogSerializer,
     ChangePasswordSerializer,
     CompanyCreateSerializer,
@@ -87,6 +101,11 @@ def org_scope(user, **filters):
 
 #: How far back the dashboard trend may be asked to go.
 MAX_TREND_MONTHS = 24
+
+#: A quarter ahead is the usual shelf check, and two years is further out than
+#: any of this stock is dated, so asking beyond it is asking for the whole list.
+DEFAULT_EXPIRY_WINDOW_DAYS = 90
+MAX_EXPIRY_WINDOW_DAYS = 730
 
 
 def requisition_month_field(user):
@@ -152,6 +171,9 @@ def token_payload(user):
 class RegisterHospitalView(APIView):
     permission_classes = [AllowAny]
     authentication_classes = []
+    # Nothing but the throttle stands between this and a table full of tenants
+    # nobody asked for.
+    throttle_scope = 'register'
 
     def post(self, request):
         serializer = HospitalRegisterSerializer(data=request.data)
@@ -165,6 +187,9 @@ class LoginView(APIView):
     # A client still holding the token that just timed out must be able to sign
     # in again; authenticating first would refuse it before it got the chance.
     authentication_classes = []
+    # A phone number and a password is the whole door, so guessing at it is
+    # rationed by address. See DEFAULT_THROTTLE_RATES.
+    throttle_scope = 'login'
 
     def post(self, request):
         serializer = LoginSerializer(data=request.data, context={'request': request})
@@ -662,9 +687,27 @@ class RequisitionViewSet(PrintMixin, viewsets.ModelViewSet):
             start, end = month_range(month)
             dated = requisition_month_field(user)
             queryset = queryset.filter(**{f'{dated}__date__gte': start, f'{dated}__date__lt': end})
-        return queryset.select_related(
+        queryset = queryset.select_related(
             'hospital', 'supplier', 'department', 'unit__department', 'created_by',
         )
+        # Only the two read actions prefetch. `submit`, `decide` and `release`
+        # all edit the lines and then serialise the same requisition object, and
+        # a prefetch filled in before the edit would answer with what the lines
+        # said beforehand.
+        #
+        # requested_value, approved_value and item_count each walk the lines, so
+        # an index page of 25 asks 75 questions without this. The list serializer
+        # does not print the lines; it only adds them up.
+        if self.action == 'list':
+            return queryset.prefetch_related('lines')
+        if self.action == 'retrieve':
+            return queryset.prefetch_related(
+                'lines__product__unit',
+                'lines__delivery_lines',
+                'deliveries__lines__requisition_line__product',
+                'deliveries__invoice__payments',
+            )
+        return queryset
 
     def get_serializer_class(self):
         return RequisitionListSerializer if self.action == 'list' else RequisitionSerializer
@@ -882,9 +925,19 @@ class DeliveryViewSet(PrintMixin, viewsets.ReadOnlyModelViewSet):
             'requisition__supplier' if user.org_kind == OrgKind.SUPPLIER
             else 'requisition__hospital'
         )
-        return Delivery.objects.filter(
+        queryset = Delivery.objects.filter(
             **org_scope(user, **{field: user.scope_org}),
-        ).select_related('requisition')
+        ).select_related('requisition__hospital', 'requisition__supplier')
+        if self.action not in ('list', 'retrieve'):
+            # `verify` writes the accepted and rejected quantities onto these
+            # lines and then serialises this same delivery. A cache filled in
+            # beforehand would report the consignment as it arrived.
+            return queryset
+        return queryset.prefetch_related(
+            # accepted_value adds up the lines, and each line names its product.
+            'lines__requisition_line__product',
+            'invoice__payments',
+        )
 
     @action(detail=True, methods=['post'])
     def verify(self, request, pk=None):
@@ -912,7 +965,14 @@ class InvoiceViewSet(PrintMixin, viewsets.ReadOnlyModelViewSet):
     def get_queryset(self):
         user = self.request.user
         field = 'supplier' if user.org_kind == OrgKind.SUPPLIER else 'hospital'
-        queryset = Invoice.objects.filter(**org_scope(user, **{field: user.scope_org}))
+        queryset = Invoice.objects.filter(
+            **org_scope(user, **{field: user.scope_org}),
+        ).select_related(
+            'hospital', 'supplier', 'delivery__requisition',
+        ).prefetch_related(
+            # amount_pending and amount_unclaimed both read the ledger.
+            'payments',
+        )
         status_param = self.request.query_params.get('status')
         if status_param:
             queryset = queryset.filter(status=status_param)
@@ -983,6 +1043,22 @@ class PaymentViewSet(PrintMixin, viewsets.ReadOnlyModelViewSet):
         payment = services.confirm_payment(self.get_object(), request.user)
         return Response(PaymentSerializer(payment, context={'request': request}).data)
 
+    @action(detail=True, methods=['get'])
+    def receipt(self, request, pk=None):
+        """The teller slip attached to a payment.
+
+        Served through the viewset because the queryset above has already
+        decided whose payment this is, and that is the same question as who may
+        look at its slip. Handing the file out on a MEDIA_URL path instead
+        answers it with nothing but an address that is hard to guess.
+        """
+        payment = self.get_object()
+        if not payment.receipt:
+            raise Http404('No receipt was attached to this payment.')
+        return FileResponse(
+            payment.receipt.open('rb'), filename=Path(payment.receipt.name).name,
+        )
+
     @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated, IsOrgAdmin])
     def reject(self, request, pk=None):
         serializer = RejectPaymentSerializer(data=request.data)
@@ -1025,6 +1101,42 @@ class StockMovementViewSet(PrintListMixin, viewsets.ReadOnlyModelViewSet):
         serializer.is_valid(raise_exception=True)
         movement = services.dispense(request.user, **serializer.validated_data)
         return Response(StockMovementSerializer(movement).data, status=status.HTTP_201_CREATED)
+
+    @action(detail=False, methods=['post'], permission_classes=[IsAuthenticated, IsOrgAdmin])
+    def adjust(self, request):
+        """A hospital writes stock off, or puts a miscount right. Signed."""
+        serializer = AdjustSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        movement = services.adjust(request.user, **serializer.validated_data)
+        return Response(StockMovementSerializer(movement).data, status=status.HTTP_201_CREATED)
+
+    @action(detail=False)
+    def expiring(self, request):
+        """Goods received with an expiry date inside the window, soonest first.
+
+        Receipts rather than balances: a dispense names no batch, so the ledger
+        cannot say how much of one particular batch is left. This is the
+        shelf-check list — what came in and when it goes out of date — and the
+        pharmacist counts the rest.
+
+        ponytail: a real per-batch balance needs the batch named on the way out
+        too. Add it when somebody asks to be told the quantity rather than where
+        to go and look.
+        """
+        raw = request.query_params.get('days', '')
+        days = int(raw) if raw.isdigit() else DEFAULT_EXPIRY_WINDOW_DAYS
+        # Already expired is the most urgent case, so the window opens backwards
+        # with no floor: everything still on the books that has passed its date.
+        cutoff = timezone.localdate() + timedelta(days=min(days, MAX_EXPIRY_WINDOW_DAYS))
+        rows = self.get_queryset().filter(
+            kind=StockMovement.RECEIPT, expiry_date__isnull=False, expiry_date__lte=cutoff,
+        ).order_by('expiry_date', 'id')
+        page = self.paginate_queryset(rows)
+        serializer = StockMovementSerializer(page if page is not None else rows, many=True)
+        return (
+            self.get_paginated_response(serializer.data) if page is not None
+            else Response(serializer.data)
+        )
 
     @action(detail=False)
     def balances(self, request):
@@ -1154,8 +1266,20 @@ def dashboard(request):
             is_active=True,
         ).count(),
         'catalogue_items': catalogue.count() if is_supplier or user.sees_all_tenants else None,
+        # Against each item's own reorder level, and against what is *available*
+        # rather than what is on the shelf: stock already promised to an approved
+        # request cannot be sold to anybody else.
         'low_stock': list(
-            catalogue.filter(stock_qty__lt=10).values('id', 'generic_name', 'stock_qty')[:10]
+            catalogue.annotate(
+                available=F('stock_qty') - F('qty_reserved'),
+                level=Coalesce(
+                    'reorder_level',
+                    Value(DEFAULT_REORDER_LEVEL, output_field=DecimalField()),
+                ),
+            )
+            .filter(available__lt=F('level'))
+            .order_by('available')
+            .values('id', 'generic_name', 'stock_qty', 'available', 'level')[:10]
         ) if is_supplier or user.sees_all_tenants else [],
         'recent': RequisitionListSerializer(
             requisitions.select_related('hospital', 'supplier')[:10], many=True,
