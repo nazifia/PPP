@@ -90,7 +90,8 @@ def when(value):
     if not value:
         return DASH
     if isinstance(value, datetime):
-        return timezone.localtime(value).strftime('%d %b %Y, %H:%M')
+        # %I pads the hour: '01:05 PM' reads better as '1:05 PM'.
+        return timezone.localtime(value).strftime('%d %b %Y, %I:%M %p').replace(', 0', ', ')
     return value.strftime('%d %b %Y')
 
 

@@ -8,7 +8,7 @@ import 'package:printing/printing.dart';
 import 'api.dart';
 
 final money = NumberFormat.currency(symbol: '₦', decimalDigits: 2);
-final shortDate = DateFormat('d MMM yyyy, HH:mm');
+final shortDate = DateFormat('d MMM yyyy, h:mm a');
 
 String formatDate(String? iso) =>
     iso == null ? '-' : shortDate.format(DateTime.parse(iso).toLocal());
