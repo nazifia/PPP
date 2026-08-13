@@ -375,7 +375,10 @@ class _ProductDialogState extends State<_ProductDialog> {
     'brand': TextEditingController(text: '${widget.product?['brand'] ?? ''}'),
     'strength': TextEditingController(text: '${widget.product?['strength'] ?? ''}'),
     'unit_price': TextEditingController(text: '${widget.product?['unit_price'] ?? '0.00'}'),
-    'stock_qty': TextEditingController(text: qtyText(widget.product?['stock_qty'] ?? 0)),
+    // Opening stock, and only that. Once the item exists its stock moves
+    // through Restock, which writes the ledger row a quiet edit here would not;
+    // the server refuses the change either way.
+    if (widget.product == null) 'stock_qty': TextEditingController(text: '0'),
     'max_order_qty': TextEditingController(
       text: widget.product?['max_order_qty'] == null
           ? ''

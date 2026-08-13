@@ -270,6 +270,57 @@ class _HomeShellState extends State<HomeShell> {
   int _index = 0;
   bool _askedForNewPassword = false;
 
+  /// What is waiting on this account, per tab. Read from the dashboard, which
+  /// already counts every one of them for the screen it draws — a notification
+  /// table would be a second copy of the same figures, kept up to date by hand
+  /// and wrong the first time somebody forgot to write to it.
+  Map<int, int> _waiting = const {};
+  bool _counting = false;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) => _count());
+  }
+
+  /// Nothing pushes, so the counts are refreshed when the shell is touched:
+  /// on sign-in and on every tab change. Cheap, and never stale by more than
+  /// one tap.
+  Future<void> _count() async {
+    if (_counting || !mounted) return;
+    _counting = true;
+    final api = ApiScope.of(context);
+    try {
+      final data = await api.get('/dashboard/') as Map<String, dynamic>;
+      int at(String key) => (data[key] as num?)?.toInt() ?? 0;
+      final counts = <int, int>{
+        // A supplier's queue is requests to decide; a hospital's is
+        // consignments at the door to check in.
+        if (api.isSupplier) 2: at('awaiting_action') else 3: at('deliveries_in_transit'),
+        // Money lives behind More: payments to confirm, and debts running late.
+        4: at('payments_pending') + at('invoices_overdue'),
+      };
+      if (mounted) {
+        setState(() => _waiting = {
+          for (final entry in counts.entries)
+            if (entry.value > 0) entry.key: entry.value,
+        });
+      }
+    } catch (_) {
+      // A badge is a courtesy. A failed count is not worth a red screen, and
+      // the tab it would have marked still opens.
+    } finally {
+      _counting = false;
+    }
+  }
+
+  /// The tab icon, with what is waiting on it if anything is.
+  Widget _tabIcon(int index, IconData icon) {
+    final count = _waiting[index];
+    if (count == null) return Icon(icon);
+    return Badge.count(count: count, child: Icon(icon));
+  }
+
   @override
   Widget build(BuildContext context) {
     final api = ApiScope.of(context);
@@ -294,7 +345,11 @@ class _HomeShellState extends State<HomeShell> {
       WidgetsBinding.instance.addPostFrameCallback((_) => _forcePasswordChange(context));
     }
 
-    void select(int value) => setState(() => _index = value);
+    void select(int value) {
+      setState(() => _index = value);
+      // Acting on what a badge pointed at is what clears it, so recount.
+      _count();
+    }
     // Tablets and desktop get a side rail; phones keep the bottom bar.
     final width = MediaQuery.sizeOf(context).width;
     final wide = width >= 720;
@@ -322,8 +377,11 @@ class _HomeShellState extends State<HomeShell> {
                             extended: extended,
                             labelType: extended ? null : NavigationRailLabelType.all,
                             destinations: [
-                              for (final (icon, label) in tabs)
-                                NavigationRailDestination(icon: Icon(icon), label: Text(label)),
+                              for (final (index, (icon, label)) in tabs.indexed)
+                                NavigationRailDestination(
+                                  icon: _tabIcon(index, icon),
+                                  label: Text(label),
+                                ),
                             ],
                             // The rail has no "More" overflow the way the bottom bar
                             // does, so sign out gets its own spot under the tabs.
@@ -365,8 +423,8 @@ class _HomeShellState extends State<HomeShell> {
                 selectedIndex: _index,
                 onDestinationSelected: select,
                 destinations: [
-                  for (final (icon, label) in tabs)
-                    NavigationDestination(icon: Icon(icon), label: label),
+                  for (final (index, (icon, label)) in tabs.indexed)
+                    NavigationDestination(icon: _tabIcon(index, icon), label: label),
                 ],
               ),
             ),

@@ -73,6 +73,7 @@ const statusColors = <String, Color>{
   'PAID': Colors.green,
   'PENDING': Colors.orange,
   'CONFIRMED': Colors.green,
+  'WITHDRAWN': Colors.brown,
   'PARTIAL': Colors.teal,
   'AVL': Colors.green,
   'RV': Colors.blue,

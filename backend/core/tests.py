@@ -13,6 +13,7 @@ from django.core.cache import cache
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.core.management import call_command
 from django.db import connection
+from django.db.models import Sum
 from django.test import TestCase, override_settings
 from django.test.utils import CaptureQueriesContext
 from django.urls import reverse
@@ -23,6 +24,7 @@ from rest_framework.test import APITestCase
 
 from .models import (
     Delivery,
+    DeliveryStatus,
     Department,
     DispensingUnit,
     Invoice,
@@ -35,6 +37,7 @@ from .models import (
     PaymentStatus,
     Product,
     Requisition,
+    RequisitionLine,
     ReqStatus,
     Role,
     StockMovement,
@@ -1173,7 +1176,10 @@ class SupplyFlowTests(APITestCase):
         # Both tenants' rows, including a hospital draft it has no partnership for.
         self.assertEqual(self.client.get('/api/products/').data['count'], 1)
         self.assertEqual(self.client.get('/api/requisitions/').data['count'], 1)
-        self.assertEqual(self.client.get('/api/companies/').data['count'], 2)
+        # Every supplier, and only suppliers: the hospital is a tenant, not a
+        # company anybody trades with.
+        companies = self.client.get('/api/companies/').data['results']
+        self.assertEqual([row['name'] for row in companies], [self.supplier.name])
         self.assertEqual(self.client.get('/api/audit-logs/').status_code, 200)
         self.assertEqual(self.client.get('/api/dashboard/').status_code, 200)
         # But it belongs to no organisation, so it cannot write on one's behalf.
@@ -2190,6 +2196,605 @@ class SupplyFlowTests(APITestCase):
                 f'/api/users/{outsider.id}/', {'full_name': 'Renamed'}, format='json',
             ).status_code,
             404,
+        )
+
+    def test_a_line_cannot_be_moved_onto_another_item(self):
+        """The item on a line is fixed; the quantity is not.
+
+        Swapping it walked past the check that a line's product belongs to the
+        company the request was raised against.
+        """
+        other_supplier = Organization.objects.create(
+            name='DCL Lab Products', kind=OrgKind.SUPPLIER, phone='08000000009',
+        )
+        theirs = Product.objects.create(
+            supplier=other_supplier, generic_name='Rapid Test Kit', unit=self.carton,
+            unit_price='500.00', stock_qty=50,
+        )
+        mine = Product.objects.create(
+            supplier=self.supplier, generic_name='Normal Saline', unit=self.carton,
+            unit_price='300.00', stock_qty=50,
+        )
+
+        self.login('08011111111')
+        draft = self.client.post(
+            '/api/requisitions/wishlist/add/', {'product': self.product.id, 'qty': 4},
+            format='json',
+        ).data
+        line = draft['lines'][0]['id']
+
+        for product in (theirs.id, mine.id):
+            response = self.client.patch(
+                f'/api/requisition-lines/{line}/', {'product': product}, format='json',
+            )
+            self.assertEqual(response.status_code, 400, response.data)
+
+        # The quantity still moves, and the item is where it was.
+        self.assertEqual(
+            self.client.patch(
+                f'/api/requisition-lines/{line}/', {'qty_requested': 6}, format='json',
+            ).status_code,
+            200,
+        )
+        row = RequisitionLine.objects.get(pk=line)
+        self.assertEqual(row.product_id, self.product.id)
+        self.assertEqual(row.qty_requested, Decimal('6.0'))
+
+    def test_stock_moves_through_restock_and_not_through_the_catalogue_form(self):
+        """A direct edit would write no ledger row and skip the reserved floor."""
+        self.login('08022222222')
+        movements = StockMovement.objects.filter(product=self.product).count()
+
+        refused = self.client.patch(
+            f'/api/products/{self.product.id}/', {'stock_qty': 999}, format='json',
+        )
+        self.assertEqual(refused.status_code, 400, refused.data)
+        self.product.refresh_from_db()
+        self.assertEqual(self.product.stock_qty, 100)
+
+        # Everything else on the row still edits, including sending the
+        # unchanged stock figure back with it.
+        edited = self.client.patch(
+            f'/api/products/{self.product.id}/',
+            {'brand': 'Unicare', 'stock_qty': 100}, format='json',
+        )
+        self.assertEqual(edited.status_code, 200, edited.data)
+
+        # Restock is the door, and it records what it did.
+        restocked = self.client.post(
+            f'/api/products/{self.product.id}/restock/', {'qty': 25}, format='json',
+        )
+        self.assertEqual(restocked.status_code, 200, restocked.data)
+        self.product.refresh_from_db()
+        self.assertEqual(self.product.stock_qty, 125)
+        self.assertEqual(StockMovement.objects.filter(product=self.product).count(), movements + 1)
+
+    def test_a_credit_note_reverses_what_was_accepted_and_found_bad(self):
+        """Verification catches what is visible at the door. This catches the rest."""
+        invoice = self.raise_invoice(qty=10)  # 10 * 720 = 7200
+        delivery_line = invoice.delivery.lines.get()
+
+        self.login('08011111111')
+        creditable = self.client.get(f'/api/invoices/{invoice.id}/creditable/')
+        self.assertEqual(creditable.status_code, 200, creditable.data)
+        self.assertEqual(qty := creditable.data[0]['qty_creditable'], Decimal('10.0'))
+
+        # A note has to say what is wrong with the goods.
+        self.assertEqual(
+            self.client.post(
+                f'/api/invoices/{invoice.id}/credit/',
+                {'lines': [{'line': delivery_line.id, 'qty': 3}]}, format='json',
+            ).status_code,
+            400,
+        )
+        # And it cannot credit more than was accepted.
+        self.assertEqual(
+            self.client.post(
+                f'/api/invoices/{invoice.id}/credit/',
+                {'lines': [{'line': delivery_line.id, 'qty': qty + 1}], 'reason': 'bad batch'},
+                format='json',
+            ).status_code,
+            400,
+        )
+
+        raised = self.client.post(
+            f'/api/invoices/{invoice.id}/credit/',
+            {'lines': [{'line': delivery_line.id, 'qty': 3}], 'reason': 'counterfeit batch'},
+            format='json',
+        )
+        self.assertEqual(raised.status_code, 201, raised.data)
+        self.assertEqual(raised.data['status'], 'PENDING')
+        self.assertEqual(raised.data['amount'], '2160.00')  # 3 * 720
+
+        # Nothing moves on the hospital's word alone.
+        invoice.refresh_from_db()
+        self.assertEqual(str(invoice.amount), '7200.00')
+        # And the same cartons cannot be credited twice over.
+        self.assertEqual(
+            self.client.get(f'/api/invoices/{invoice.id}/creditable/').data[0]['qty_creditable'],
+            Decimal('7.0'),
+        )
+
+        # The hospital does not accept its own note.
+        self.assertEqual(
+            self.client.post(
+                f"/api/credits/{raised.data['id']}/confirm/", format='json',
+            ).status_code,
+            403,
+        )
+
+        self.login('08022222222')
+        confirmed = self.client.post(
+            f"/api/credits/{raised.data['id']}/confirm/", format='json',
+        )
+        self.assertEqual(confirmed.status_code, 200, confirmed.data)
+        self.assertEqual(confirmed.data['status'], 'CONFIRMED')
+
+        # The debt falls, and the goods leave the hospital's books with it.
+        invoice.refresh_from_db()
+        self.assertEqual(str(invoice.amount), '5040.00')
+        self.assertEqual(str(invoice.balance), '5040.00')
+        held = StockMovement.objects.filter(
+            organization=self.hospital, product=self.product,
+        ).aggregate(Sum('qty'))['qty__sum']
+        self.assertEqual(held, Decimal('7.0'))
+
+        # Deciding it twice changes nothing.
+        self.assertEqual(
+            self.client.post(
+                f"/api/credits/{raised.data['id']}/confirm/", format='json',
+            ).status_code,
+            400,
+        )
+
+        # A refusal needs a reason, and moves nothing.
+        self.login('08011111111')
+        second = self.client.post(
+            f'/api/invoices/{invoice.id}/credit/',
+            {'lines': [{'line': delivery_line.id, 'qty': 2}], 'reason': 'short dated'},
+            format='json',
+        ).data
+        self.login('08022222222')
+        self.assertEqual(
+            self.client.post(f"/api/credits/{second['id']}/reject/", format='json').status_code,
+            400,
+        )
+        refused = self.client.post(
+            f"/api/credits/{second['id']}/reject/", {'reason': 'dates were on the note'},
+            format='json',
+        )
+        self.assertEqual(refused.status_code, 200, refused.data)
+        invoice.refresh_from_db()
+        self.assertEqual(str(invoice.amount), '5040.00')
+        # A refused note frees the cartons it had spoken for.
+        self.login('08011111111')
+        self.assertEqual(
+            self.client.get(f'/api/invoices/{invoice.id}/creditable/').data[0]['qty_creditable'],
+            Decimal('7.0'),
+        )
+
+    def test_a_credit_note_stops_at_what_is_still_owed(self):
+        """The platform moves no money, so it cannot hand any back."""
+        invoice = self.raise_invoice(qty=10)
+        delivery_line = invoice.delivery.lines.get()
+
+        self.login('08011111111')
+        payment = self.client.post(
+            f'/api/invoices/{invoice.id}/pay/',
+            {'amount': '6000.00', 'method': PaymentMethod.CASH}, format='json',
+        ).data
+        self.login('08022222222')
+        self.client.post(f"/api/payments/{payment['id']}/confirm/", format='json')
+
+        # 1200 left owing, so a 2160 credit is a refund, not a credit.
+        self.login('08011111111')
+        too_much = self.client.post(
+            f'/api/invoices/{invoice.id}/credit/',
+            {'lines': [{'line': delivery_line.id, 'qty': 3}], 'reason': 'bad batch'},
+            format='json',
+        )
+        self.assertEqual(too_much.status_code, 400, too_much.data)
+        self.assertIn('refund', str(too_much.data))
+
+        # What is still owed can be credited, and that settles the invoice.
+        raised = self.client.post(
+            f'/api/invoices/{invoice.id}/credit/',
+            {'lines': [{'line': delivery_line.id, 'qty': 1}], 'reason': 'one bad carton'},
+            format='json',
+        )
+        self.assertEqual(raised.status_code, 201, raised.data)
+        self.login('08022222222')
+        self.client.post(f"/api/credits/{raised.data['id']}/confirm/", format='json')
+        invoice.refresh_from_db()
+        self.assertEqual(str(invoice.amount), '6480.00')
+        self.assertEqual(str(invoice.balance), '480.00')
+        self.assertEqual(invoice.status, InvoiceStatus.PART_PAID)
+
+    def test_health_answers_without_a_token(self):
+        """Whatever watches the process holds no credentials."""
+        self.client.credentials()
+        response = self.client.get('/api/health/')
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(response.data['status'], 'ok')
+
+    def test_an_organisation_phone_is_checked_in_the_form_it_is_stored_in(self):
+        """Spaced or dashed, it is the same number — and a refusal, not a 500."""
+        self.login('08011111111')
+        response = self.client.patch(
+            # The supplier's number, written the way it would be read aloud.
+            '/api/organization/', {'phone': '0800 000-0002'}, format='json',
+        )
+        self.assertEqual(response.status_code, 400, response.data)
+        self.hospital.refresh_from_db()
+        self.assertEqual(self.hospital.phone, '08000000001')
+
+        # Its own number back again is not a clash with itself.
+        self.assertEqual(
+            self.client.patch(
+                '/api/organization/', {'phone': '0800-000 0001'}, format='json',
+            ).status_code,
+            200,
+        )
+
+    def test_a_suspended_organisation_loses_its_open_sessions(self):
+        """Login refuses one; a session opened before it must not outlive it."""
+        self.login('08011111111')
+        self.assertEqual(self.client.get('/api/auth/me/').status_code, 200)
+
+        Organization.objects.filter(pk=self.hospital.pk).update(is_active=False)
+        response = self.client.get('/api/auth/me/')
+        self.assertEqual(response.status_code, 401, response.data)
+        self.assertFalse(Token.objects.filter(user=self.hospital_admin).exists())
+
+    def test_a_reset_password_meets_the_same_bar_as_every_other(self):
+        staff = User.objects.create_user(
+            phone='08033333333', password='Sup3rSecret!', full_name='Ward Staff',
+            organization=self.hospital, role=Role.STAFF,
+        )
+        self.login('08011111111')
+        for weak in ('12345678', 'password'):
+            response = self.client.post(
+                f'/api/users/{staff.id}/reset_password/', {'new_password': weak}, format='json',
+            )
+            self.assertEqual(response.status_code, 400, response.data)
+        staff.refresh_from_db()
+        self.assertTrue(staff.check_password('Sup3rSecret!'))
+
+        good = self.client.post(
+            f'/api/users/{staff.id}/reset_password/',
+            {'new_password': 'An0therSecret!'}, format='json',
+        )
+        self.assertEqual(good.status_code, 200, good.data)
+        staff.refresh_from_db()
+        self.assertTrue(staff.must_change_password)
+
+    def test_a_retired_department_takes_no_new_work(self):
+        """Retiring one is how an organisation closes it, so it has to bite."""
+        self.login('08011111111')
+        department = Department.objects.create(organization=self.hospital, name='Theatre')
+        unit = Unit.objects.create(department=department, name='Recovery')
+
+        draft = self.client.post(
+            '/api/requisitions/wishlist/add/',
+            {'product': self.product.id, 'qty': 2, 'department': department.id},
+            format='json',
+        )
+        self.assertEqual(draft.status_code, 201, draft.data)
+
+        Department.objects.filter(pk=department.pk).update(is_active=False)
+        for tag in ({'department': department.id}, {'unit': unit.id}):
+            # The unit is still live in its own right; its department is not,
+            # and a department stands for its units.
+            response = self.client.post(
+                '/api/requisitions/wishlist/add/',
+                {'product': self.product.id, 'qty': 1, **tag}, format='json',
+            )
+            self.assertEqual(response.status_code, 400, response.data)
+            self.assertIn('retired', str(response.data))
+
+        # The draft raised while it was open is still editable, tag and all.
+        edited = self.client.patch(
+            f"/api/requisitions/{draft.data['id']}/",
+            {'note': 'still ours', 'department': department.id}, format='json',
+        )
+        self.assertEqual(edited.status_code, 200, edited.data)
+
+    def test_a_retired_term_describes_no_new_item(self):
+        self.login('08022222222')
+        retired = DispensingUnit.objects.create(supplier=self.supplier, name='JAR')
+        listed = self.client.post(
+            '/api/products/',
+            {'generic_name': 'Zinc Oxide', 'unit': retired.id, 'unit_price': '80.00'},
+            format='json',
+        )
+        self.assertEqual(listed.status_code, 201, listed.data)
+
+        DispensingUnit.objects.filter(pk=retired.pk).update(is_active=False)
+        refused = self.client.post(
+            '/api/products/',
+            {'generic_name': 'Calamine', 'unit': retired.id, 'unit_price': '90.00'},
+            format='json',
+        )
+        self.assertEqual(refused.status_code, 400, refused.data)
+
+        # The item already described by it is not stranded: its price still edits.
+        priced = self.client.patch(
+            f"/api/products/{listed.data['id']}/",
+            {'unit_price': '95.00', 'unit': retired.id}, format='json',
+        )
+        self.assertEqual(priced.status_code, 200, priced.data)
+
+    def test_an_account_cannot_close_itself(self):
+        """/users/ refuses to close the last administrator; this is the way round."""
+        self.login('08011111111')
+        response = self.client.patch('/api/auth/me/', {'is_active': False}, format='json')
+        self.assertEqual(response.status_code, 200, response.data)
+        self.hospital_admin.refresh_from_db()
+        self.assertTrue(self.hospital_admin.is_active)
+
+    def test_a_suspended_link_stops_the_approval_too(self):
+        requisition, line = self.submit_request('08011111111', 5)
+        Partnership.objects.filter(
+            hospital=self.hospital, supplier=self.supplier,
+        ).update(is_active=False)
+
+        self.login('08022222222')
+        response = self.client.post(
+            f'/api/requisitions/{requisition}/decide/',
+            {'lines': [{'line': line, 'qty_approved': 5}]}, format='json',
+        )
+        self.assertEqual(response.status_code, 400, response.data)
+        self.product.refresh_from_db()
+        self.assertEqual(self.product.qty_reserved, 0)  # nothing promised
+
+    def test_adjust_cannot_invent_stock_for_an_item_never_received(self):
+        """An adjustment corrects a ledger. It does not start one."""
+        self.login('08011111111')
+        response = self.client.post(
+            '/api/stock-movements/adjust/',
+            {'product': self.product.id, 'qty': 50, 'reason': 'found some'}, format='json',
+        )
+        self.assertEqual(response.status_code, 400, response.data)
+        self.assertEqual(
+            StockMovement.objects.filter(organization=self.hospital).count(), 0,
+        )
+
+        # Once a delivery has actually landed, the same correction goes through.
+        self.raise_invoice(qty=10)
+        self.login('08011111111')
+        corrected = self.client.post(
+            '/api/stock-movements/adjust/',
+            {'product': self.product.id, 'qty': -2, 'reason': 'broken in the store'},
+            format='json',
+        )
+        self.assertEqual(corrected.status_code, 201, corrected.data)
+
+    def test_the_same_item_is_not_listed_twice(self):
+        self.login('08022222222')
+        item = {
+            'generic_name': 'Amoxicillin', 'brand': 'Amoxil', 'strength': '500mg',
+            'unit': self.carton.id, 'unit_price': '1200.00',
+        }
+        self.assertEqual(self.client.post('/api/products/', item, format='json').status_code, 201)
+
+        again = self.client.post('/api/products/', item, format='json')
+        self.assertEqual(again.status_code, 400, again.data)
+
+        # A different strength is a different item, and so is another company's.
+        self.assertEqual(
+            self.client.post(
+                '/api/products/', {**item, 'strength': '250mg'}, format='json',
+            ).status_code,
+            201,
+        )
+
+        # Renaming one onto another is the same clash by another road.
+        rows = self.client.get('/api/products/', {'search': 'Amoxicillin'}).data['results']
+        moved = self.client.patch(
+            f"/api/products/{rows[0]['id']}/", {'strength': rows[1]['strength']}, format='json',
+        )
+        self.assertEqual(moved.status_code, 400, moved.data)
+
+    def test_stale_deliveries_names_what_nobody_verified(self):
+        requisition, line = self.submit_request('08011111111', 6)
+        self.login('08022222222')
+        self.client.post(
+            f'/api/requisitions/{requisition}/decide/',
+            {'lines': [{'line': line, 'qty_approved': 6}]}, format='json',
+        )
+        delivery = self.client.post(
+            f'/api/requisitions/{requisition}/dispatch/',
+            {'items': [{'line': line, 'qty': 6}]}, format='json',
+        ).data
+
+        out = StringIO()
+        call_command('stale_deliveries', '--days', '7', stdout=out)
+        self.assertIn('0 consignment(s)', out.getvalue())
+
+        # Age it past the window: it is named, and nothing is decided for anyone.
+        Delivery.objects.filter(pk=delivery['id']).update(
+            dispatched_at=timezone.now() - timedelta(days=9),
+        )
+        out = StringIO()
+        call_command('stale_deliveries', '--days', '7', stdout=out)
+        self.assertIn(delivery['reference'], out.getvalue())
+        self.assertIn('1 consignment(s)', out.getvalue())
+        self.assertFalse(Invoice.objects.exists())
+        self.assertEqual(
+            Delivery.objects.get(pk=delivery['id']).status, DeliveryStatus.IN_TRANSIT,
+        )
+
+    def test_an_item_added_with_stock_on_it_opens_the_ledger(self):
+        """Otherwise the ledger starts short of the shelf and never catches up."""
+        self.login('08022222222')
+        created = self.client.post(
+            '/api/products/',
+            {
+                'generic_name': 'Paracetamol', 'strength': '500mg',
+                'unit': self.carton.id, 'unit_price': '150.00', 'stock_qty': '40',
+            },
+            format='json',
+        )
+        self.assertEqual(created.status_code, 201, created.data)
+        opening = StockMovement.objects.get(product_id=created.data['id'])
+        self.assertEqual(opening.qty, Decimal('40.0'))
+        self.assertEqual(opening.kind, StockMovement.ADJUST)
+        self.assertEqual(opening.organization_id, self.supplier.id)
+
+        # The ledger and the shelf now say the same thing, and go on doing so.
+        self.client.post(f"/api/products/{created.data['id']}/restock/", {'qty': 10}, format='json')
+        product = Product.objects.get(pk=created.data['id'])
+        self.assertEqual(product.stock_qty, Decimal('50.0'))
+        self.assertEqual(
+            StockMovement.objects.filter(product=product).aggregate(Sum('qty'))['qty__sum'],
+            product.stock_qty,
+        )
+
+        # An item added with nothing on it opens no row.
+        empty = self.client.post(
+            '/api/products/',
+            {'generic_name': 'Ibuprofen', 'unit': self.carton.id, 'unit_price': '90.00'},
+            format='json',
+        )
+        self.assertEqual(empty.status_code, 201, empty.data)
+        self.assertFalse(StockMovement.objects.filter(product_id=empty.data['id']).exists())
+
+    def test_a_hospital_links_a_company_another_hospital_registered(self):
+        """A supplier already on the platform is not the first hospital's alone."""
+        second = Organization.objects.create(
+            name='Cottage Hospital', kind=OrgKind.HOSPITAL, phone='08000000008',
+        )
+        their_admin = User.objects.create_user(
+            phone='08055555555', password='Sup3rSecret!', full_name='Cottage Admin',
+            organization=second, role=Role.ADMIN,
+        )
+
+        self.login(their_admin.phone)
+        # Nothing to trade with, so nothing to read.
+        self.assertEqual(self.client.get('/api/companies/').data['results'], [])
+        self.assertEqual(self.client.get('/api/products/').data['results'], [])
+
+        # Registering it again is refused — the phone number is taken — which is
+        # the whole reason the link exists.
+        taken = self.client.post(
+            '/api/companies/',
+            {
+                'name': 'Valour Pharmaceuticals', 'phone': self.supplier.phone,
+                'contact_full_name': 'Someone', 'contact_phone': '08066666666',
+                'password': 'An0therSecret!',
+            },
+            format='json',
+        )
+        self.assertEqual(taken.status_code, 400, taken.data)
+
+        self.assertEqual(
+            self.client.post('/api/companies/link/', {'phone': '0800-000 0000'}, format='json')
+            .status_code,
+            400,
+        )
+        linked = self.client.post(
+            # Spaced and dashed, the way it would be read off a card.
+            '/api/companies/link/', {'phone': '0800 000-0002'}, format='json',
+        )
+        self.assertEqual(linked.status_code, 201, linked.data)
+        self.assertEqual(linked.data['id'], self.supplier.id)
+        self.assertTrue(linked.data['partnership_active'])
+
+        # The catalogue is now readable, and no second account was created.
+        self.assertEqual(len(self.client.get('/api/products/').data['results']), 1)
+        self.assertEqual(User.objects.filter(organization=second).count(), 1)
+        self.assertEqual(
+            Partnership.objects.filter(supplier=self.supplier, is_active=True).count(), 2,
+        )
+
+        # Twice is a mistake, not a second link.
+        self.assertEqual(
+            self.client.post(
+                '/api/companies/link/', {'phone': self.supplier.phone}, format='json',
+            ).status_code,
+            400,
+        )
+
+        # Suspending and linking again reopens the same row rather than adding one.
+        self.client.delete(f'/api/companies/{self.supplier.id}/')
+        self.assertEqual(
+            self.client.post(
+                '/api/companies/link/', {'phone': self.supplier.phone}, format='json',
+            ).status_code,
+            201,
+        )
+        self.assertEqual(
+            Partnership.objects.filter(hospital=second, supplier=self.supplier).count(), 1,
+        )
+
+        # Ordinary staff do not redraw who the hospital trades with.
+        staff = User.objects.create_user(
+            phone='08077777777', password='Sup3rSecret!', full_name='Cottage Staff',
+            organization=second, role=Role.STAFF,
+        )
+        self.login(staff.phone)
+        self.assertEqual(
+            self.client.post(
+                '/api/companies/link/', {'phone': self.supplier.phone}, format='json',
+            ).status_code,
+            403,
+        )
+
+    def test_a_hospital_withdraws_a_payment_the_supplier_has_not_decided(self):
+        """A keying mistake is the hospital's to take back, not the supplier's."""
+        invoice = self.raise_invoice(qty=10)  # 7200.00
+        self.login('08011111111')
+        wrong = self.client.post(
+            f'/api/invoices/{invoice.id}/pay/',
+            {'amount': '7200.00', 'method': PaymentMethod.TRANSFER, 'payer_reference': 'TRF-9'},
+            format='json',
+        ).data
+
+        # While it stands, it holds down what else may be recorded.
+        invoice.refresh_from_db()
+        self.assertEqual(str(invoice.amount_unclaimed), '0.00')
+
+        # The supplier does not withdraw the hospital's entry; it rejects it.
+        self.login('08022222222')
+        self.assertEqual(
+            self.client.post(f"/api/payments/{wrong['id']}/withdraw/", format='json').status_code,
+            403,
+        )
+
+        self.login('08011111111')
+        withdrawn = self.client.post(
+            f"/api/payments/{wrong['id']}/withdraw/", {'reason': 'wrong invoice'}, format='json',
+        )
+        self.assertEqual(withdrawn.status_code, 200, withdrawn.data)
+        self.assertEqual(withdrawn.data['status'], PaymentStatus.WITHDRAWN)
+
+        # No money moved, the invoice is free again, and the slip's reference
+        # is free with it.
+        invoice.refresh_from_db()
+        self.assertEqual(invoice.status, InvoiceStatus.UNPAID)
+        self.assertEqual(str(invoice.amount_paid), '0.00')
+        self.assertEqual(str(invoice.amount_pending), '0.00')
+        self.assertEqual(str(invoice.amount_unclaimed), '7200.00')
+        again = self.client.post(
+            f'/api/invoices/{invoice.id}/pay/',
+            {'amount': '7200.00', 'method': PaymentMethod.TRANSFER, 'payer_reference': 'TRF-9'},
+            format='json',
+        )
+        self.assertEqual(again.status_code, 201, again.data)
+
+        # Withdrawing it twice, or withdrawing one already decided, is refused.
+        self.assertEqual(
+            self.client.post(f"/api/payments/{wrong['id']}/withdraw/", format='json').status_code,
+            400,
+        )
+        self.login('08022222222')
+        self.client.post(f"/api/payments/{again.data['id']}/confirm/", format='json')
+        self.login('08011111111')
+        self.assertEqual(
+            self.client.post(
+                f"/api/payments/{again.data['id']}/withdraw/", format='json',
+            ).status_code,
+            400,
         )
 
 

@@ -13,6 +13,10 @@ from django.utils import timezone
 from rest_framework.exceptions import PermissionDenied, ValidationError
 
 from .models import (
+    PAYMENT_DEAD_STATUSES,
+    CreditNote,
+    CreditNoteLine,
+    CreditStatus,
     Delivery,
     DeliveryLine,
     DeliveryStatus,
@@ -118,6 +122,15 @@ def adjust(user, product, qty, reason):
     # Same lock as a dispense, for the same reason: two adjustments must not
     # both read the balance before either has written.
     Product.objects.select_for_update().get(pk=product.pk)
+    # An adjustment corrects a ledger; it does not start one. Everything a
+    # hospital holds arrived on a verified delivery, which wrote a RECEIPT, so
+    # an item with no history here is one this hospital never had — and a
+    # positive adjustment against it would be stock conjured out of nothing,
+    # for any item on the platform, partner or not.
+    if not StockMovement.objects.filter(
+        organization=user.scope_org, product=product,
+    ).exists():
+        raise ValidationError(f'{product} has never been received here.')
     held = stock_balance(user.scope_org, product)
     if held + qty < 0:
         raise ValidationError(f'{product}: only {held} in stock, so {qty} would go below zero.')
@@ -189,6 +202,10 @@ def decide(requisition, user, decisions, note=''):
     require_supplier(user)
     if requisition.status != ReqStatus.SUBMITTED:
         raise ValidationError('Only a submitted request can be decided.')
+    # Checked at submission too, but a hospital may have suspended the link in
+    # between, and an approval reserves stock and fixes a price. The hospital
+    # cancels the request if it no longer wants it.
+    require_partner(requisition.hospital, requisition.supplier)
 
     by_id = {d.get('line'): d for d in decisions}
     lines = list(requisition.lines.select_related('product'))
@@ -557,7 +574,7 @@ def record_payment(invoice, user, amount, method, payer_reference='', note='', r
         )
     if payer_reference and invoice.payments.filter(
         payer_reference__iexact=payer_reference,
-    ).exclude(status=PaymentStatus.REJECTED).exists():
+    ).exclude(status__in=PAYMENT_DEAD_STATUSES).exists():
         raise ValidationError(f'Reference {payer_reference} is already recorded on this invoice.')
 
     payment = Payment.objects.create(
@@ -603,6 +620,212 @@ def confirm_payment(payment, user):
         invoice_status=invoice.status, balance=str(invoice.balance),
     )
     payment.invoice = invoice
+    return payment
+
+
+# ---------------------------------------------------------------------------
+# Credit notes
+#
+# Verification catches what is visible at the door. A batch that turns out to be
+# counterfeit, or that was already nearly out of date when it arrived, is found
+# weeks later, and until this existed the invoice was final from the moment it
+# was raised. Like a payment, a credit moves what one side owes the other, so
+# like a payment it takes both of them:
+#
+#   raise ──▶ PENDING ──confirm──▶ CONFIRMED  (invoice.amount falls, stock written down)
+#                    └──reject───▶ REJECTED   (nothing moves)
+# ---------------------------------------------------------------------------
+
+
+def creditable_qty(delivery_line):
+    """How much of an accepted line has not already been credited.
+
+    Counts the pending credits too: two notes for the same carton would each
+    look affordable on their own and take the invoice down twice between them.
+    """
+    spoken_for = sum(
+        (
+            line.qty for line in delivery_line.credit_lines.all()
+            if line.credit_note.status != CreditStatus.REJECTED
+        ),
+        ZERO,
+    )
+    return max(delivery_line.qty_accepted - spoken_for, ZERO)
+
+
+@transaction.atomic
+def raise_credit(invoice, user, items, reason=''):
+    """Hospital says some of what it accepted was not what it paid for.
+
+    `items` is [{'line': <delivery line id>, 'qty': <decimal>}]. Nothing moves
+    until the supplier confirms it.
+    """
+    require_owner(user, invoice.hospital, 'Not your invoice.')
+    require_hospital(user)
+    if not user.is_org_admin:
+        raise PermissionDenied('Only an organisation administrator can raise a credit note.')
+    if not (reason or '').strip():
+        raise ValidationError('Say what is wrong with the goods.')
+    if not items:
+        raise ValidationError('Name at least one item to credit.')
+
+    invoice = Invoice.objects.select_for_update().get(pk=invoice.pk)
+    lines = {
+        line.id: line
+        for line in invoice.delivery.lines.select_related(
+            'requisition_line__product',
+        ).prefetch_related('credit_lines__credit_note')
+    }
+
+    credit = CreditNote.objects.create(invoice=invoice, reason=reason.strip(), raised_by=user)
+    amount = Decimal('0.00')
+    for item in items:
+        line = lines.get(item.get('line'))
+        if line is None:
+            raise ValidationError(f"Line {item.get('line')} is not on this invoice's delivery.")
+        qty = Decimal(item.get('qty') or 0)
+        if qty <= 0:
+            continue
+        free = creditable_qty(line)
+        if qty > free:
+            raise ValidationError(
+                f'{line.requisition_line.product}: only {free} of what was accepted is '
+                f'still open to credit.'
+            )
+        CreditNoteLine.objects.create(credit_note=credit, delivery_line=line, qty=qty)
+        amount += line.requisition_line.unit_price * qty
+
+    if not credit.lines.exists():
+        raise ValidationError('Name at least one item to credit.')
+
+    amount = _money(amount)
+    # The platform moves no money, so it cannot hand any back. A credit larger
+    # than the debt is a refund the two sides arrange between themselves.
+    if amount > invoice.balance:
+        raise ValidationError(
+            f'That credits {amount} against a {invoice.balance} balance. Credit what is '
+            f'still owed; anything already paid is a refund to settle between you.'
+        )
+    credit.amount = amount
+    credit.save(update_fields=['amount'])
+    audit(
+        user, 'CreditNote', credit.pk, 'RAISED',
+        invoice=invoice.reference, amount=str(amount), reason=credit.reason,
+    )
+    return credit
+
+
+@transaction.atomic
+def confirm_credit(credit, user):
+    """Supplier accepts the credit. This is what moves the invoice."""
+    invoice = credit.invoice
+    require_owner(user, invoice.supplier, 'Not your invoice.')
+    require_supplier(user)
+    if not user.is_org_admin:
+        raise PermissionDenied('Only an organisation administrator can accept a credit note.')
+    if credit.status != CreditStatus.PENDING:
+        raise ValidationError('This credit note has already been decided.')
+
+    invoice = Invoice.objects.select_for_update().get(pk=invoice.pk)
+    if credit.amount > invoice.balance:
+        # A payment landed first and left less owing than this credits.
+        raise ValidationError(
+            f'Only {invoice.balance} is outstanding on this invoice now. Refuse this note '
+            f'and ask for one against what is left.'
+        )
+
+    for line in credit.lines.select_related('delivery_line__requisition_line__product'):
+        # The goods leave the hospital's books: it is not holding them as stock,
+        # whatever it does with them next. They do not go back on the supplier's
+        # shelf either — bad goods are not stock, and where they physically end
+        # up is between the two of them.
+        StockMovement.objects.create(
+            organization=invoice.hospital,
+            product=line.delivery_line.requisition_line.product,
+            kind=StockMovement.RETURN, qty=-line.qty,
+            delivery=invoice.delivery,
+            batch_no=line.delivery_line.batch_no,
+            expiry_date=line.delivery_line.expiry_date,
+            note=f'Credit {credit.reference}: {credit.reason}'[:255],
+        )
+
+    invoice.amount = _money(invoice.amount - credit.amount)
+    # What is owed just fell, which may be all that was left of it.
+    if invoice.amount_paid >= invoice.amount:
+        invoice.status = InvoiceStatus.PAID
+        invoice.paid_at = invoice.paid_at or timezone.now()
+    elif invoice.amount_paid > 0:
+        invoice.status = InvoiceStatus.PART_PAID
+    invoice.save(update_fields=['amount', 'status', 'paid_at'])
+
+    credit.status = CreditStatus.CONFIRMED
+    credit.decided_by = user
+    credit.decided_at = timezone.now()
+    credit.save(update_fields=['status', 'decided_by', 'decided_at'])
+    audit(
+        user, 'CreditNote', credit.pk, 'CONFIRMED',
+        invoice=invoice.reference, amount=str(credit.amount),
+        invoice_amount=str(invoice.amount), balance=str(invoice.balance),
+    )
+    credit.invoice = invoice
+    return credit
+
+
+@transaction.atomic
+def reject_credit(credit, user, reason=''):
+    """Supplier refuses the credit. The invoice does not move."""
+    require_owner(user, credit.invoice.supplier, 'Not your invoice.')
+    require_supplier(user)
+    if not user.is_org_admin:
+        raise PermissionDenied('Only an organisation administrator can refuse a credit note.')
+    if credit.status != CreditStatus.PENDING:
+        raise ValidationError('This credit note has already been decided.')
+    if not (reason or '').strip():
+        raise ValidationError('Say why the credit note is being refused.')
+
+    credit.status = CreditStatus.REJECTED
+    credit.decided_by = user
+    credit.decided_at = timezone.now()
+    credit.reject_reason = reason.strip()
+    credit.save(update_fields=['status', 'decided_by', 'decided_at', 'reject_reason'])
+    audit(
+        user, 'CreditNote', credit.pk, 'REJECTED',
+        invoice=credit.invoice.reference, amount=str(credit.amount),
+        reason=credit.reject_reason,
+    )
+    return credit
+
+
+@transaction.atomic
+def withdraw_payment(payment, user, reason=''):
+    """Hospital takes back an entry the supplier has not decided yet.
+
+    A payment recorded against the wrong invoice, or for the wrong amount, is
+    otherwise the supplier's to clear: until it is rejected the entry keeps
+    counting towards `amount_pending`, and so holds down what a corrected entry
+    may be recorded for. The invoice does not move either way — nothing was ever
+    confirmed — and the withdrawn entry stays on the ledger, so the correction
+    reads as a correction rather than as a payment that never happened.
+    """
+    require_owner(user, payment.invoice.hospital, 'Not your payment.')
+    require_hospital(user)
+    if not user.is_org_admin:
+        raise PermissionDenied('Only an organisation administrator can withdraw a payment.')
+    if payment.status != PaymentStatus.PENDING:
+        raise ValidationError('This payment has already been decided.')
+
+    payment.status = PaymentStatus.WITHDRAWN
+    payment.decided_by = user
+    payment.decided_at = timezone.now()
+    # The same column the supplier's refusal writes to, because it answers the
+    # same question: why this entry came to nothing.
+    payment.reject_reason = (reason or '').strip()
+    payment.save(update_fields=['status', 'decided_by', 'decided_at', 'reject_reason'])
+    audit(
+        user, 'Payment', payment.pk, 'WITHDRAWN',
+        invoice=payment.invoice.reference, amount=str(payment.amount),
+        reason=payment.reject_reason,
+    )
     return payment
 
 

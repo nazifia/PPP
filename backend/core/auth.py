@@ -43,6 +43,13 @@ class ActAsOrgAuthentication(TokenAuthentication):
         """
         user, token = super().authenticate_credentials(key)
         org = user.organization  # The account's own tenant, not one it acts as.
+        # Login refuses a suspended organisation, but a session opened before
+        # the suspension would otherwise run on untouched until it went idle.
+        # Read here rather than hooked to the save, so it holds however the
+        # organisation was suspended — the API, the admin site or a shell.
+        if org is not None and not org.is_active:
+            token.delete()
+            raise AuthenticationFailed('Your organisation has been suspended.')
         limit = timedelta(
             minutes=org.idle_timeout_minutes if org else DEFAULT_IDLE_MINUTES,
         )

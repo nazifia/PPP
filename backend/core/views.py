@@ -2,6 +2,10 @@ from datetime import date, timedelta
 from decimal import Decimal
 from pathlib import Path
 
+from django.contrib.auth.password_validation import validate_password
+from django.core.exceptions import ValidationError as DjangoValidationError
+from django.db import connection, transaction
+from django.db.utils import OperationalError
 from django.db.models import (
     BooleanField,
     Count,
@@ -18,7 +22,12 @@ from django.http import FileResponse, Http404
 from django.utils import timezone
 from rest_framework import filters, mixins, status, viewsets
 from rest_framework.authtoken.models import Token
-from rest_framework.decorators import action, api_view, permission_classes
+from rest_framework.decorators import (
+    action,
+    api_view,
+    authentication_classes,
+    permission_classes,
+)
 from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.permissions import (
     AllowAny,
@@ -32,6 +41,7 @@ from . import services
 from .models import (
     DEFAULT_REORDER_LEVEL,
     AuditLog,
+    CreditNote,
     Delivery,
     Department,
     DispensingUnit,
@@ -52,6 +62,7 @@ from .models import (
     Unit,
     User,
     audit,
+    normalize_phone,
 )
 from .printing import PrintListMixin, PrintMixin
 from .serializers import (
@@ -60,6 +71,7 @@ from .serializers import (
     ChangePasswordSerializer,
     CompanyCreateSerializer,
     CompanySerializer,
+    CreditNoteSerializer,
     DecideSerializer,
     DispenseSerializer,
     DeliverySerializer,
@@ -74,7 +86,9 @@ from .serializers import (
     PaymentSerializer,
     ProductSerializer,
     QuantityField,
+    RaiseCreditSerializer,
     RecordPaymentSerializer,
+    RejectCreditSerializer,
     RejectPaymentSerializer,
     RequisitionLineSerializer,
     RequisitionListSerializer,
@@ -168,6 +182,28 @@ def token_payload(user):
     return {'token': token.key, 'user': UserSerializer(user).data}
 
 
+@api_view(['GET'])
+@authentication_classes([])
+@permission_classes([AllowAny])
+def health(request):
+    """Is the process up, and can it still reach its database?
+
+    Unauthenticated on purpose: whatever watches this — a load balancer, an
+    uptime check, a container's readiness probe — holds no token, and the answer
+    tells a stranger nothing they could not learn by knocking on the login door.
+    Django keeps connections open between requests, so a database that went away
+    is only found by asking it something.
+    """
+    try:
+        connection.ensure_connection()
+    except OperationalError:
+        return Response(
+            {'status': 'error', 'database': 'unreachable'},
+            status=status.HTTP_503_SERVICE_UNAVAILABLE,
+        )
+    return Response({'status': 'ok'})
+
+
 class RegisterHospitalView(APIView):
     permission_classes = [AllowAny]
     authentication_classes = []
@@ -217,7 +253,14 @@ class MeView(APIView):
     def patch(self, request):
         # Role is granted by an administrator through /users/, never by the
         # account itself, or any member of staff could promote themselves.
-        data = {key: value for key, value in request.data.items() if key != 'role'}
+        # is_active goes the same way: closing an account is an administrator's
+        # call, and /users/ refuses to close the last one an organisation has.
+        # Left open here, that check is walked round by the last administrator
+        # closing their own account and locking the tenant out of itself.
+        data = {
+            key: value for key, value in request.data.items()
+            if key not in ('role', 'is_active')
+        }
         serializer = UserSerializer(request.user, data=data, partial=True)
         serializer.is_valid(raise_exception=True)
         serializer.save()
@@ -284,7 +327,10 @@ class CompanyViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         user = self.request.user
-        queryset = Organization.objects.all()
+        # This list is the supplier companies a hospital trades with, so a
+        # hospital has no place on it — least of all as something to register a
+        # request against.
+        queryset = Organization.objects.filter(kind=OrgKind.SUPPLIER)
         if user.sees_all_tenants:
             # No hospital of its own, so nothing is suspended for it.
             queryset = queryset.annotate(
@@ -306,7 +352,7 @@ class CompanyViewSet(viewsets.ModelViewSet):
     def get_permissions(self):
         # Registering a company, editing it or suspending the trading link is
         # an administrator's call; every member of staff may read the list.
-        if self.action in WRITE_ACTIONS + ('reactivate',):
+        if self.action in WRITE_ACTIONS + ('reactivate', 'link'):
             return [IsAuthenticated(), IsHospital(), IsOrgAdmin()]
         return [IsAuthenticated(), IsHospital()]
 
@@ -328,6 +374,45 @@ class CompanyViewSet(viewsets.ModelViewSet):
             hospital=self.request.user.scope_org, supplier=instance,
         ).update(is_active=False)
         audit(self.request.user, 'Partnership', instance.pk, 'SUSPENDED', company=instance.name)
+
+    @action(detail=False, methods=['post'])
+    def link(self, request):
+        """Start trading with a company already on the platform.
+
+        `create` above puts a new company on the platform and opens its login
+        account. This opens the trading link to one that is already there,
+        because another hospital registered it first — without which a supplier
+        can only ever serve the hospital that typed it in.
+
+        The company is named by its phone number, which is what it hands out and
+        what the platform already treats as its identity. Nothing is created:
+        the company keeps its own account, its own catalogue and its own staff.
+        """
+        require_org(request.user)
+        phone = normalize_phone(request.data.get('phone'))
+        supplier = (
+            Organization.objects.filter(phone=phone, kind=OrgKind.SUPPLIER).first()
+            if phone else None
+        )
+        if supplier is None:
+            raise ValidationError({'phone': 'No supplier company with that phone number.'})
+        # get_or_create rather than create: a link suspended long ago is the
+        # same link, and reopening it is what `reactivate` does by another road.
+        link, created = Partnership.objects.get_or_create(
+            hospital=request.user.scope_org, supplier=supplier,
+        )
+        if not created and link.is_active:
+            raise ValidationError('You already trade with that company.')
+        if not link.is_active:
+            link.is_active = True
+            link.save(update_fields=['is_active'])
+        audit(request.user, 'Partnership', supplier.pk, 'LINKED', company=supplier.name)
+        # Read back through the queryset, which carries the partnership state and
+        # the item count the list shows.
+        return Response(
+            CompanySerializer(self.get_queryset().get(pk=supplier.pk)).data,
+            status=status.HTTP_201_CREATED,
+        )
 
     @action(detail=True, methods=['post'])
     def reactivate(self, request, pk=None):
@@ -418,8 +503,13 @@ class UserViewSet(viewsets.ModelViewSet):
     def reset_password(self, request, pk=None):
         user = self.get_object()
         new_password = request.data.get('new_password') or ''
-        if len(new_password) < 8:
-            raise ValidationError('New password must be at least 8 characters.')
+        # The same validators sign-up and change-password run. A reset is the
+        # one password path an administrator picks for somebody else, which is
+        # the last place a weak one should be easier to set than a strong one.
+        try:
+            validate_password(new_password, user)
+        except DjangoValidationError as error:
+            raise ValidationError({'new_password': error.messages})
         user.set_password(new_password)
         user.must_change_password = True
         user.save(update_fields=['password', 'must_change_password'])
@@ -591,12 +681,25 @@ class ProductViewSet(viewsets.ModelViewSet):
             return [IsAuthenticated(), IsOrgAdmin()]
         return [IsAuthenticated()]
 
+    @transaction.atomic
     def perform_create(self, serializer):
         user = self.request.user
         if user.org_kind != OrgKind.SUPPLIER:
             raise PermissionDenied('Only a supplier can add catalogue items.')
         product = serializer.save(supplier=user.scope_org)
-        audit(user, 'Product', product.pk, 'CREATED', name=str(product))
+        # An item that arrives with stock on it has to say where that stock came
+        # from, or the ledger starts life owing the shelf its opening figure and
+        # never catches up: every later movement is recorded, only this one was
+        # not. `restock` writes the same row for every move after this one.
+        if product.stock_qty:
+            StockMovement.objects.create(
+                organization=product.supplier, product=product,
+                kind=StockMovement.ADJUST, qty=product.stock_qty, note='Opening stock',
+            )
+        audit(
+            user, 'Product', product.pk, 'CREATED',
+            name=str(product), opening_stock=product.stock_qty,
+        )
 
     def perform_update(self, serializer):
         services.require_owner(
@@ -639,12 +742,27 @@ class ProductViewSet(viewsets.ModelViewSet):
         return Response(ProductSerializer(product).data)
 
 
-def _check_own_tags(user, data):
-    """A request may only be tagged with the caller's own department or unit."""
+def _check_own_tags(user, data, instance=None):
+    """A request may only be tagged with the caller's own live department or unit.
+
+    Retiring one is how an organisation stops new work being filed under it. The
+    requests already tagged with it stay where they are — `instance` is the one
+    being edited, and a tag it already carries is left alone — and it keeps its
+    place in the list, so it can be brought back.
+    """
     for field in ('department', 'unit'):
         tag = data.get(field)
-        if tag and tag.organization_id != user.scope_org_id:
+        if not tag:
+            continue
+        if tag.organization_id != user.scope_org_id:
             raise ValidationError(f'That {field} belongs to another organisation.')
+        if instance is not None and getattr(instance, f'{field}_id') == tag.pk:
+            continue
+        # A department stands for its units here as it does everywhere else, so
+        # retiring one closes the units under it too — otherwise the work goes
+        # on being filed one level down.
+        if not tag.is_active or (field == 'unit' and not tag.department.is_active):
+            raise ValidationError(f'That {field} has been retired.')
 
 
 class RequisitionViewSet(PrintMixin, viewsets.ModelViewSet):
@@ -744,7 +862,7 @@ class RequisitionViewSet(PrintMixin, viewsets.ModelViewSet):
         services.require_owner(self.request.user, instance.hospital, 'Not your requisition.')
         if instance.status != ReqStatus.DRAFT:
             raise ValidationError('Only a draft request can be edited.')
-        _check_own_tags(self.request.user, serializer.validated_data)
+        _check_own_tags(self.request.user, serializer.validated_data, instance)
         # Retagging must not collide with the draft that tag already owns,
         # which the unique constraint would otherwise refuse mid-save.
         tags = {
@@ -901,7 +1019,18 @@ class RequisitionLineViewSet(
         serializer.save(requisition=requisition, unit_price=product.unit_price)
 
     def perform_update(self, serializer):
-        self._check_draft(serializer.instance.requisition)
+        line = serializer.instance
+        self._check_draft(line.requisition)
+        # A line is a quantity of one item. Swapping the item is asking for a
+        # different line: it would walk past the supplier check `perform_create`
+        # makes, putting another company's product on the request, and land on
+        # the (requisition, product) unique constraint if the request already
+        # carries the item. Remove the line and add the other one.
+        product = serializer.validated_data.get('product')
+        if product is not None and product.pk != line.product_id:
+            raise ValidationError(
+                'A line cannot change its item. Remove it and add the other one.'
+            )
         serializer.save()
 
     def perform_destroy(self, instance):
@@ -1010,6 +1139,44 @@ class InvoiceViewSet(PrintMixin, viewsets.ReadOnlyModelViewSet):
             ).data,
         )
 
+    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated, IsOrgAdmin])
+    def credit(self, request, pk=None):
+        """Hospital raises a credit for goods it accepted and then found bad.
+
+        Nothing moves until the supplier accepts it — see `/credits/`.
+        """
+        serializer = RaiseCreditSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        credit = services.raise_credit(
+            self.get_object(), request.user,
+            serializer.validated_data['lines'],
+            serializer.validated_data['reason'],
+        )
+        return Response(CreditNoteSerializer(credit).data, status=status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=['get'])
+    def creditable(self, request, pk=None):
+        """What is still open to credit on this invoice, line by line.
+
+        The screen that raises one needs to know what is left after earlier
+        notes, and working that out client-side is how two of them come to
+        disagree.
+        """
+        invoice = self.get_object()
+        lines = invoice.delivery.lines.select_related(
+            'requisition_line__product',
+        ).prefetch_related('credit_lines__credit_note')
+        return Response([
+            {
+                'line': line.id,
+                'product_name': str(line.requisition_line.product),
+                'unit_price': line.requisition_line.unit_price,
+                'qty_accepted': line.qty_accepted,
+                'qty_creditable': services.creditable_qty(line),
+            }
+            for line in lines
+        ])
+
 
 class PaymentViewSet(PrintMixin, viewsets.ReadOnlyModelViewSet):
     """The payment ledger. Recorded through `/invoices/{id}/pay/`, decided here."""
@@ -1043,6 +1210,14 @@ class PaymentViewSet(PrintMixin, viewsets.ReadOnlyModelViewSet):
         payment = services.confirm_payment(self.get_object(), request.user)
         return Response(PaymentSerializer(payment, context={'request': request}).data)
 
+    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated, IsOrgAdmin])
+    def withdraw(self, request, pk=None):
+        """Hospital takes back an entry the supplier has not decided yet."""
+        payment = services.withdraw_payment(
+            self.get_object(), request.user, request.data.get('reason', ''),
+        )
+        return Response(PaymentSerializer(payment, context={'request': request}).data)
+
     @action(detail=True, methods=['get'])
     def receipt(self, request, pk=None):
         """The teller slip attached to a payment.
@@ -1067,6 +1242,50 @@ class PaymentViewSet(PrintMixin, viewsets.ReadOnlyModelViewSet):
             self.get_object(), request.user, serializer.validated_data['reason'],
         )
         return Response(PaymentSerializer(payment, context={'request': request}).data)
+
+
+class CreditNoteViewSet(viewsets.ReadOnlyModelViewSet):
+    """Credit notes. Raised through `/invoices/{id}/credit/`, decided here.
+
+    The same shape as the payment ledger, because it is the same kind of thing:
+    one side says what it thinks it owes, the other says whether it agrees, and
+    only agreement moves the invoice.
+    """
+
+    serializer_class = CreditNoteSerializer
+    permission_classes = [IsAuthenticated]
+    filter_backends = [filters.SearchFilter]
+    search_fields = ['reference', 'reason', 'invoice__reference']
+
+    def get_queryset(self):
+        user = self.request.user
+        field = (
+            'invoice__supplier' if user.org_kind == OrgKind.SUPPLIER else 'invoice__hospital'
+        )
+        queryset = CreditNote.objects.filter(
+            **org_scope(user, **{field: user.scope_org}),
+        ).select_related(
+            'invoice__hospital', 'invoice__supplier', 'raised_by', 'decided_by',
+        ).prefetch_related('lines__delivery_line__requisition_line__product')
+        for param, column in (('status', 'status'), ('invoice', 'invoice_id')):
+            value = self.request.query_params.get(param)
+            if value:
+                queryset = queryset.filter(**{column: value})
+        return queryset
+
+    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated, IsOrgAdmin])
+    def confirm(self, request, pk=None):
+        credit = services.confirm_credit(self.get_object(), request.user)
+        return Response(CreditNoteSerializer(credit).data)
+
+    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated, IsOrgAdmin])
+    def reject(self, request, pk=None):
+        serializer = RejectCreditSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        credit = services.reject_credit(
+            self.get_object(), request.user, serializer.validated_data['reason'],
+        )
+        return Response(CreditNoteSerializer(credit).data)
 
 
 class StockMovementViewSet(PrintListMixin, viewsets.ReadOnlyModelViewSet):

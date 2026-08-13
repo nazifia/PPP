@@ -18,10 +18,12 @@ router.register('requisition-lines', views.RequisitionLineViewSet, basename='req
 router.register('deliveries', views.DeliveryViewSet, basename='delivery')
 router.register('invoices', views.InvoiceViewSet, basename='invoice')
 router.register('payments', views.PaymentViewSet, basename='payment')
+router.register('credits', views.CreditNoteViewSet, basename='credit')
 router.register('stock-movements', views.StockMovementViewSet, basename='stock-movement')
 router.register('audit-logs', views.AuditLogViewSet, basename='audit-log')
 
 urlpatterns = [
+    path('health/', views.health, name='health'),
     path('auth/register/', views.RegisterHospitalView.as_view(), name='register'),
     path('auth/login/', views.LoginView.as_view(), name='login'),
     path('auth/logout/', views.LogoutView.as_view(), name='logout'),

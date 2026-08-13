@@ -94,11 +94,30 @@ class MoreScreen extends StatelessWidget {
               onTap: () => open(const PaymentsScreen()),
             ),
             ListTile(
+              leading: const Icon(Icons.assignment_return_outlined),
+              title: const Text('Credit notes'),
+              subtitle: Text(
+                api.isSupplier
+                    ? 'Accept or refuse what hospitals say arrived bad'
+                    : 'What you have raised against goods that arrived bad',
+              ),
+              onTap: () => open(const CreditsScreen()),
+            ),
+            ListTile(
               leading: const Icon(Icons.swap_vert),
               title: const Text('Stock ledger'),
               subtitle: const Text('Every item in and out'),
               onTap: () => open(const StockLedgerScreen()),
             ),
+            // A supplier's stock carries no expiry date until it is delivered,
+            // so the shelf check belongs to whoever is holding the shelf.
+            if (api.canActAsHospital)
+              ListTile(
+                leading: const Icon(Icons.event_busy_outlined),
+                title: const Text('Expiring stock'),
+                subtitle: const Text('What is going out of date, soonest first'),
+                onTap: () => open(const ExpiringScreen()),
+              ),
             ListTile(
               leading: const Icon(Icons.people_outline),
               title: const Text('Staff accounts'),
@@ -218,11 +237,42 @@ class _CompaniesScreenState extends State<CompaniesScreen> {
     super.dispose();
   }
 
+  Future<void> _link(BuildContext context, Api api) async {
+    final phone = await promptText(
+      context,
+      title: 'Link a company',
+      hint: 'The company\'s phone number',
+    );
+    if (phone == null || phone.trim().isEmpty || !context.mounted) return;
+    // A link joins two organisations, so the hospital side has to be named.
+    final org = await orgField(context, api, kind: 'HOSPITAL');
+    if (org == null || !context.mounted) return;
+    try {
+      await api.post('/companies/link/', {'phone': phone.trim(), ...org});
+      _controller.reload();
+    } catch (error) {
+      if (context.mounted) showError(context, error);
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final api = ApiScope.of(context);
     return Scaffold(
-      appBar: AppBar(title: const Text('Supplier companies')),
+      appBar: AppBar(
+        title: const Text('Supplier companies'),
+        actions: [
+          // A company another hospital put on the platform already has its own
+          // account and catalogue, so there is nothing to register — only a
+          // trading link to open, and its phone number is what names it.
+          if (api.isAdmin)
+            IconButton(
+              icon: const Icon(Icons.add_link),
+              tooltip: 'Trade with a company already on the platform',
+              onPressed: () => _link(context, api),
+            ),
+        ],
+      ),
       floatingActionButton: api.isAdmin
           ? FloatingActionButton.extended(
               onPressed: () async {
@@ -988,6 +1038,20 @@ class _InvoicesScreenState extends State<InvoicesScreen> {
                         children: [
                           StatusChip(daysOverdue > 0 ? 'OVERDUE' : '${invoice['status']}'),
                           IconButton(
+                            icon: const Icon(Icons.assignment_return_outlined),
+                            tooltip: 'Credit notes',
+                            onPressed: () async {
+                              await Navigator.push(
+                                context,
+                                MaterialPageRoute<void>(
+                                  builder: (_) => CreditsScreen(invoice: invoice),
+                                ),
+                              );
+                              // A confirmed credit changes what this row owes.
+                              reload();
+                            },
+                          ),
+                          IconButton(
                             icon: const Icon(Icons.history),
                             tooltip: 'Payments',
                             onPressed: () => Navigator.push(
@@ -1246,8 +1310,352 @@ Future<bool> decidePayment(BuildContext context, Map<String, dynamic> payment, b
   }
 }
 
+/// Goods accepted at the door and found bad afterwards — a counterfeit batch, a
+/// batch already nearly out of date. Verification cannot catch those, so the
+/// invoice would otherwise be final from the moment it was raised.
+///
+/// Shaped like a payment because it is the same kind of thing: it moves what one
+/// side owes the other, so it takes both of them.
+class _RaiseCreditDialog extends StatefulWidget {
+  const _RaiseCreditDialog({required this.invoice});
+
+  final Map<String, dynamic> invoice;
+
+  @override
+  State<_RaiseCreditDialog> createState() => _RaiseCreditDialogState();
+}
+
+class _RaiseCreditDialogState extends State<_RaiseCreditDialog> {
+  late final Future<List<Map<String, dynamic>>> _lines;
+  final _qty = <Object, TextEditingController>{};
+  final _reason = TextEditingController();
+  bool _busy = false;
+
+  @override
+  void initState() {
+    super.initState();
+    // What is left after earlier notes, from the server: working it out here is
+    // how the two come to disagree.
+    _lines = ApiScope.of(context)
+        .get('/invoices/${widget.invoice['id']}/creditable/')
+        .then((rows) => (rows as List).cast<Map<String, dynamic>>());
+  }
+
+  @override
+  void dispose() {
+    for (final controller in _qty.values) {
+      controller.dispose();
+    }
+    _reason.dispose();
+    super.dispose();
+  }
+
+  Future<void> _submit() async {
+    final lines = <Map<String, dynamic>>[];
+    for (final entry in _qty.entries) {
+      if (entry.value.text.trim().isEmpty) continue;
+      final asked = parseQty(entry.value.text);
+      if (asked == null || asked <= 0) {
+        showError(context, badQtyMessage);
+        return;
+      }
+      lines.add({'line': entry.key, 'qty': asked});
+    }
+    if (lines.isEmpty) {
+      showError(context, 'Name at least one item to credit.');
+      return;
+    }
+    if (_reason.text.trim().isEmpty) {
+      showError(context, 'Say what is wrong with the goods.');
+      return;
+    }
+    final api = ApiScope.of(context);
+    final org = await orgField(context, api, kind: 'HOSPITAL');
+    if (org == null || !mounted) return;
+    setState(() => _busy = true);
+    try {
+      await api.post('/invoices/${widget.invoice['id']}/credit/', {
+        'lines': lines,
+        'reason': _reason.text.trim(),
+        ...org,
+      });
+      if (mounted) Navigator.pop(context, true);
+    } catch (error) {
+      if (mounted) showError(context, error);
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Text('Raise a credit note'),
+      content: SizedBox(
+        width: dialogWidth(context, 420),
+        child: FutureBuilder<List<Map<String, dynamic>>>(
+          future: _lines,
+          builder: (context, snapshot) {
+            if (snapshot.connectionState != ConnectionState.done) {
+              return const SizedBox(height: 80, child: Center(child: CircularProgressIndicator()));
+            }
+            if (snapshot.hasError) return Text('${snapshot.error}');
+            final open = [
+              for (final row in snapshot.data!)
+                if (qty(row['qty_creditable']) > 0) row,
+            ];
+            if (open.isEmpty) {
+              return const Text('Everything on this invoice has already been credited.');
+            }
+            return SingleChildScrollView(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const Align(
+                    alignment: Alignment.centerLeft,
+                    child: Padding(
+                      padding: EdgeInsets.only(bottom: 8),
+                      child: Text('Leave a line blank to keep it.'),
+                    ),
+                  ),
+                  for (final row in open)
+                    Padding(
+                      padding: const EdgeInsets.only(bottom: 10),
+                      child: TextField(
+                        controller: _qty.putIfAbsent(
+                          row['line'] as Object,
+                          TextEditingController.new,
+                        ),
+                        keyboardType: qtyKeyboard(),
+                        decoration: InputDecoration(
+                          labelText: '${row['product_name']}',
+                          helperText:
+                              '${qtyText(row['qty_creditable'])} still open · '
+                              '${amount(row['unit_price'])} each',
+                          isDense: true,
+                        ),
+                      ),
+                    ),
+                  TextField(
+                    controller: _reason,
+                    decoration: const InputDecoration(
+                      labelText: 'What is wrong with them',
+                      hintText: 'Counterfeit batch, arrived short dated',
+                    ),
+                  ),
+                ],
+              ),
+            );
+          },
+        ),
+      ),
+      actions: [
+        TextButton(onPressed: () => Navigator.pop(context), child: const Text('Cancel')),
+        FilledButton(
+          onPressed: _busy ? null : _submit,
+          child: Text(_busy ? 'Saving...' : 'Raise'),
+        ),
+      ],
+    );
+  }
+}
+
+/// The company says whether it accepts the credit. Returns true when it decided.
+Future<bool> decideCredit(BuildContext context, Map<String, dynamic> credit, bool accept) async {
+  final api = ApiScope.of(context);
+  String? reason;
+  if (!accept) {
+    reason = await promptText(
+      context,
+      title: 'Why is the credit refused?',
+      hint: 'The dates were on the delivery note…',
+    );
+    if (reason == null || reason.trim().isEmpty) return false;
+  } else if (!await confirm(
+    context,
+    'Accept credit note',
+    'Take ${amount(credit['amount'])} off invoice ${credit['invoice_reference']}? '
+        'The goods come off the hospital\'s books with it.',
+  )) {
+    return false;
+  }
+  if (!context.mounted) return false;
+  try {
+    await api.post(
+      '/credits/${credit['id']}/${accept ? 'confirm' : 'reject'}/',
+      accept ? null : {'reason': reason},
+    );
+    return true;
+  } catch (error) {
+    if (context.mounted) showError(context, error);
+    return false;
+  }
+}
+
+/// Credit notes, for one invoice or across the board. A company administrator
+/// decides a pending note here; the hospital raises them and watches.
+class CreditsScreen extends StatefulWidget {
+  const CreditsScreen({super.key, this.invoice});
+
+  /// Set to show only one invoice's notes, and to offer raising another.
+  final Map<String, dynamic>? invoice;
+
+  @override
+  State<CreditsScreen> createState() => _CreditsScreenState();
+}
+
+class _CreditsScreenState extends State<CreditsScreen> {
+  final _controller = LoaderController();
+  String _status = '';
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  Future<void> _raise() async {
+    final raised = await showDialog<bool>(
+      context: context,
+      builder: (_) => _RaiseCreditDialog(invoice: widget.invoice!),
+    );
+    if (raised == true) _controller.reload();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final api = ApiScope.of(context);
+    final invoice = widget.invoice;
+    return Scaffold(
+      appBar: AppBar(
+        title: Text(
+          invoice == null ? 'Credit notes' : 'Credits · ${invoice['reference']}',
+        ),
+      ),
+      floatingActionButton: invoice != null && api.canActAsHospital && api.isAdmin
+          ? FloatingActionButton.extended(
+              onPressed: _raise,
+              icon: const Icon(Icons.receipt_long_outlined),
+              label: const Text('Raise credit'),
+            )
+          : null,
+      body: Column(
+        children: [
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+            child: Wrap(
+              spacing: 8,
+              children: [
+                for (final status in ['PENDING', 'CONFIRMED', 'REJECTED', ''])
+                  ChoiceChip(
+                    label: Text(status.isEmpty ? 'All' : status),
+                    selected: _status == status,
+                    onSelected: (_) {
+                      setState(() => _status = status);
+                      _controller.reload();
+                    },
+                  ),
+              ],
+            ),
+          ),
+          Expanded(
+            child: Loader<List<Map<String, dynamic>>>(
+              controller: _controller,
+              load: () => api.list('/credits/', {
+                'status': _status,
+                if (invoice != null) 'invoice': '${invoice['id']}',
+              }),
+              builder: (context, rows, reload) {
+                if (rows.isEmpty) {
+                  return const EmptyState(
+                    'No credit notes here.',
+                    icon: Icons.receipt_long_outlined,
+                  );
+                }
+                return ListView.separated(
+                  itemCount: rows.length,
+                  separatorBuilder: (_, _) => const Divider(height: 1),
+                  itemBuilder: (context, index) {
+                    final credit = rows[index];
+                    final pending = credit['status'] == 'PENDING';
+                    final canDecide = api.canActAsSupplier && api.isAdmin && pending;
+                    final items = (credit['lines'] as List)
+                        .map((line) => '${line['product_name']} x${qtyText(line['qty'])}')
+                        .join(', ');
+                    return ListTile(
+                      isThreeLine: true,
+                      leading: const Icon(Icons.assignment_return_outlined),
+                      title: Text(
+                        '${amount(credit['amount'])} · invoice ${credit['invoice_reference']}',
+                      ),
+                      subtitle: Text(
+                        '${credit['reason']}\n$items'
+                        '${'${credit['reject_reason'] ?? ''}'.isEmpty ? '' : '\nRefused: ${credit['reject_reason']}'}',
+                      ),
+                      trailing: canDecide
+                          ? Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                IconButton(
+                                  icon: const Icon(Icons.close),
+                                  tooltip: 'Refuse',
+                                  onPressed: () async {
+                                    if (await decideCredit(context, credit, false)) reload();
+                                  },
+                                ),
+                                IconButton(
+                                  icon: const Icon(Icons.check),
+                                  tooltip: 'Accept',
+                                  onPressed: () async {
+                                    if (await decideCredit(context, credit, true)) reload();
+                                  },
+                                ),
+                              ],
+                            )
+                          : StatusChip('${credit['status']}'),
+                    );
+                  },
+                );
+              },
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// The hospital takes back an entry the company has not decided yet: the wrong
+/// invoice, the wrong amount, a slip keyed twice. Returns true when it did.
+Future<bool> withdrawPayment(BuildContext context, Map<String, dynamic> payment) async {
+  if (!await confirm(
+    context,
+    'Withdraw payment',
+    'Take back the ${amount(payment['amount'])} recorded against invoice '
+        '${payment['invoice_reference']}? It stays on the ledger as withdrawn, and '
+        'the invoice is free to be paid again.',
+  )) {
+    return false;
+  }
+  if (!context.mounted) return false;
+  final reason = await promptText(
+    context,
+    title: 'Why is it being withdrawn?',
+    hint: 'Wrong invoice, keyed twice…',
+  );
+  if (reason == null || !context.mounted) return false;
+  try {
+    await ApiScope.of(context).post('/payments/${payment['id']}/withdraw/', {'reason': reason});
+    return true;
+  } catch (error) {
+    if (context.mounted) showError(context, error);
+    return false;
+  }
+}
+
 /// One line of the ledger, wherever the ledger is shown. A company admin
-/// decides a pending payment from here; everyone else reads its status.
+/// decides a pending payment from here, and the hospital that recorded it may
+/// take it back until they do; everyone else reads its status.
 class PaymentTile extends StatelessWidget {
   const PaymentTile({super.key, required this.payment, required this.onChanged});
 
@@ -1257,7 +1665,9 @@ class PaymentTile extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final api = ApiScope.of(context);
-    final canDecide = api.canActAsSupplier && api.isAdmin && payment['status'] == 'PENDING';
+    final pending = payment['status'] == 'PENDING';
+    final canDecide = api.canActAsSupplier && api.isAdmin && pending;
+    final canWithdraw = api.canActAsHospital && api.isAdmin && pending;
     final receipt = '${payment['receipt'] ?? ''}';
     final party = api.isSupplier ? payment['hospital_name'] : payment['supplier_name'];
     return ListTile(
@@ -1289,6 +1699,14 @@ class PaymentTile extends StatelessWidget {
             tooltip: payment['status'] == 'CONFIRMED' ? 'Print receipt' : 'Print advice',
             name: payment['status'] == 'CONFIRMED' ? 'Payment receipt' : 'Payment advice',
           ),
+          if (canWithdraw)
+            IconButton(
+              icon: const Icon(Icons.undo),
+              tooltip: 'Withdraw',
+              onPressed: () async {
+                if (await withdrawPayment(context, payment)) onChanged();
+              },
+            ),
           if (canDecide) ...[
             IconButton(
               icon: const Icon(Icons.close),
@@ -1304,8 +1722,8 @@ class PaymentTile extends StatelessWidget {
                 if (await decidePayment(context, payment, true)) onChanged();
               },
             ),
-          ] else
-            StatusChip('${payment['status']}'),
+          ],
+          if (!canDecide && !canWithdraw) StatusChip('${payment['status']}'),
         ],
       ),
     );
@@ -1378,7 +1796,7 @@ class _PaymentsScreenState extends State<PaymentsScreen> {
             child: Wrap(
               spacing: 8,
               children: [
-                for (final status in ['PENDING', 'CONFIRMED', 'REJECTED', ''])
+                for (final status in ['PENDING', 'CONFIRMED', 'REJECTED', 'WITHDRAWN', ''])
                   ChoiceChip(
                     label: Text(status.isEmpty ? 'All' : status),
                     selected: _status == status,
@@ -1577,6 +1995,14 @@ class _StockLedgerScreenState extends State<StockLedgerScreen> {
     if (recorded == true) _controller.reload();
   }
 
+  Future<void> _adjust() async {
+    final recorded = await showDialog<bool>(
+      context: context,
+      builder: (_) => _AdjustDialog(product: widget.product),
+    );
+    if (recorded == true) _controller.reload();
+  }
+
   Future<void> _pickRange() async {
     if (_range != null) {
       setState(() => _range = null);
@@ -1607,6 +2033,16 @@ class _StockLedgerScreenState extends State<StockLedgerScreen> {
       appBar: AppBar(
         title: Text(widget.productName ?? 'Stock ledger'),
         actions: [
+          // Dispensing means a ward used the goods; everything else that takes
+          // something off the shelf comes through here, and it answers to an
+          // administrator because it is the one way stock moves without a
+          // delivery or a ward behind it.
+          if (ApiScope.of(context).canActAsHospital && ApiScope.of(context).isAdmin)
+            IconButton(
+              icon: const Icon(Icons.edit_note),
+              tooltip: 'Adjust stock',
+              onPressed: _adjust,
+            ),
           // The same filters the list is showing, so the sheet covers what is
           // on screen. Balances are a different query and print nothing yet.
           if (!_showBalances)
@@ -1838,6 +2274,245 @@ class _DispenseDialogState extends State<_DispenseDialog> {
           child: Text(_busy ? 'Saving...' : 'Record'),
         ),
       ],
+    );
+  }
+}
+
+/// Puts the ledger right when something left the shelf without being dispensed:
+/// a drug past its date, a broken vial, a count that never matched the book.
+/// Signed, so a negative writes stock off and a positive corrects a miscount,
+/// and always explained — an unexplained correction is indistinguishable from a
+/// mistake later on.
+class _AdjustDialog extends StatefulWidget {
+  const _AdjustDialog({this.product});
+
+  final Object? product;
+
+  @override
+  State<_AdjustDialog> createState() => _AdjustDialogState();
+}
+
+class _AdjustDialogState extends State<_AdjustDialog> {
+  final _qty = TextEditingController();
+  final _reason = TextEditingController();
+  late final Future<List<Map<String, dynamic>>> _held;
+  Object? _product;
+  bool _busy = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _product = widget.product;
+    // Every item the ledger has ever heard of here, including the ones it has
+    // run down to nothing: a miscount is corrected upwards as often as down.
+    // An item with no history at all is one this hospital never received, and
+    // the server refuses it.
+    _held = ApiScope.of(context).list('/stock-movements/balances/');
+  }
+
+  @override
+  void dispose() {
+    _qty.dispose();
+    _reason.dispose();
+    super.dispose();
+  }
+
+  Future<void> _submit() async {
+    final change = parseQty(_qty.text);
+    if (_product == null || change == null || change == 0) {
+      showError(context, 'Pick an item and a signed quantity. $badQtyMessage');
+      return;
+    }
+    if (_reason.text.trim().isEmpty) {
+      showError(context, 'Say why the ledger is being adjusted.');
+      return;
+    }
+    final api = ApiScope.of(context);
+    final org = await orgField(context, api, kind: 'HOSPITAL');
+    if (org == null || !mounted) return;
+    setState(() => _busy = true);
+    try {
+      await api.post('/stock-movements/adjust/', {
+        'product': _product,
+        'qty': change,
+        'reason': _reason.text.trim(),
+        ...org,
+      });
+      if (mounted) Navigator.pop(context, true);
+    } catch (error) {
+      if (mounted) showError(context, error);
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Text('Adjust stock'),
+      content: SizedBox(
+        width: dialogWidth(context, 380),
+        child: FutureBuilder<List<Map<String, dynamic>>>(
+          future: _held,
+          builder: (context, snapshot) {
+            if (snapshot.connectionState != ConnectionState.done) {
+              return const SizedBox(height: 80, child: Center(child: CircularProgressIndicator()));
+            }
+            if (snapshot.hasError) return Text('${snapshot.error}');
+            final rows = snapshot.data!;
+            if (rows.isEmpty) {
+              return const Text('Nothing has been received here yet.');
+            }
+            return SingleChildScrollView(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  DropdownButtonFormField<Object>(
+                    initialValue: rows.any((row) => row['product'] == _product) ? _product : null,
+                    isExpanded: true,
+                    decoration: const InputDecoration(labelText: 'Item'),
+                    items: [
+                      for (final row in rows)
+                        DropdownMenuItem<Object>(
+                          value: row['product'],
+                          child: Text(
+                            '${row['product_name']} · ${qtyText(row['balance'])} on the books',
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        ),
+                    ],
+                    onChanged: (value) => setState(() => _product = value),
+                  ),
+                  const SizedBox(height: 12),
+                  TextField(
+                    controller: _qty,
+                    keyboardType: qtyKeyboard(signed: true),
+                    decoration: const InputDecoration(
+                      labelText: 'Change',
+                      helperText: '-2 writes two off; 2 puts two back',
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                  TextField(
+                    controller: _reason,
+                    decoration: const InputDecoration(
+                      labelText: 'Reason',
+                      hintText: 'Expired, broken, miscounted',
+                    ),
+                  ),
+                ],
+              ),
+            );
+          },
+        ),
+      ),
+      actions: [
+        TextButton(onPressed: () => Navigator.pop(context), child: const Text('Cancel')),
+        FilledButton(
+          onPressed: _busy ? null : _submit,
+          child: Text(_busy ? 'Saving...' : 'Adjust'),
+        ),
+      ],
+    );
+  }
+}
+
+/// The shelf check: what was received with an expiry date inside the window,
+/// soonest first, already-expired at the top.
+///
+/// Receipts rather than balances, because a dispense names no batch — so this
+/// says what came in and when it goes out of date, and the pharmacist counts
+/// what is left of it. See `expiring` in core/views.py.
+class ExpiringScreen extends StatefulWidget {
+  const ExpiringScreen({super.key});
+
+  @override
+  State<ExpiringScreen> createState() => _ExpiringScreenState();
+}
+
+class _ExpiringScreenState extends State<ExpiringScreen> {
+  final _controller = LoaderController();
+
+  /// The windows worth offering. The server caps anything past two years.
+  static const _windows = {30: '30 days', 90: '3 months', 180: '6 months', 365: 'a year'};
+  int _days = 90;
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final api = ApiScope.of(context);
+    final today = DateTime.now();
+    return Scaffold(
+      appBar: AppBar(title: const Text('Expiring stock')),
+      body: Column(
+        children: [
+          Bounded(
+            child: SizedBox(
+              height: 48,
+              child: ListView(
+                scrollDirection: Axis.horizontal,
+                padding: const EdgeInsets.symmetric(horizontal: 12),
+                children: [
+                  for (final entry in _windows.entries)
+                    Padding(
+                      padding: const EdgeInsets.only(right: 8),
+                      child: ChoiceChip(
+                        label: Text(entry.value),
+                        selected: _days == entry.key,
+                        onSelected: (_) {
+                          setState(() => _days = entry.key);
+                          _controller.reload();
+                        },
+                      ),
+                    ),
+                ],
+              ),
+            ),
+          ),
+          Expanded(
+            child: Loader<List<Map<String, dynamic>>>(
+              controller: _controller,
+              load: () => api.list('/stock-movements/expiring/', {'days': '$_days'}),
+              builder: (context, rows, reload) {
+                if (rows.isEmpty) {
+                  return EmptyState(
+                    'Nothing dated inside ${_windows[_days]}.',
+                    icon: Icons.event_available_outlined,
+                  );
+                }
+                return ListView.separated(
+                  itemCount: rows.length,
+                  separatorBuilder: (_, _) => const Divider(height: 1),
+                  itemBuilder: (context, index) {
+                    final row = rows[index];
+                    final expiry = DateTime.tryParse('${row['expiry_date']}');
+                    final gone = expiry != null && expiry.isBefore(today);
+                    return ListTile(
+                      leading: Icon(
+                        gone ? Icons.dangerous_outlined : Icons.schedule,
+                        color: gone ? Theme.of(context).colorScheme.error : null,
+                      ),
+                      title: Text('${row['product_name']}'),
+                      subtitle: Text(
+                        '${gone ? 'Expired' : 'Expires'} ${formatDate('${row['expiry_date']}')}'
+                        '${'${row['batch_no']}'.isEmpty ? '' : ' · batch ${row['batch_no']}'}\n'
+                        'received ${qtyText(row['qty'])} on '
+                        '${formatDate(row['created_at'] as String?)}',
+                      ),
+                      isThreeLine: true,
+                    );
+                  },
+                );
+              },
+            ),
+          ),
+        ],
+      ),
     );
   }
 }

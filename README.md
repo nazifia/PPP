@@ -40,6 +40,10 @@ One `Organization` table holds both kinds of tenant, told apart by `kind`:
 `HOSPITAL` or `SUPPLIER`. A user belongs to exactly one organisation and is either
 `ADMIN` or `STAFF` within it.
 
+Suspending an organisation (`is_active`) shuts it out at once, not at the next login: the
+sessions already open are cut on their next request, however the suspension was made — the
+API, the admin site or a shell.
+
 A hospital splits itself into `Department`s, and a department into `Unit`s. A request
 carries one or the other — `department` or `unit` — and a department stands for its own
 units when anything is counted or filtered, so tagging the unit is enough: unit staff
@@ -48,18 +52,37 @@ there: a unit holds no units of its own. Department names are unique within an
 organisation and unit names within their department, so two departments may each keep
 their own `HAEMATOLOGY`.
 
+Clearing `is_active` on a department or a unit retires it: no new request may be tagged with
+it, and retiring a department closes the units under it, since a department stands for its
+units here as it does everywhere else. Nothing already tagged with it moves, an open draft
+that carries it stays editable, and it keeps its place in the list so it can be brought
+back. The dispensing units and formulations work the same way — a retired term describes no
+new item, and the items already described by it keep it.
+
 An organisation administrator opens the accounts inside it, edits any detail of one —
-name, phone, email, job title and role, between `ADMIN` and `STAFF` — resets a forgotten password (the owner must change it at next login)
+name, phone, email, job title and role, between `ADMIN` and `STAFF` — resets a forgotten
+password (held to the same validators as sign-up, and the owner must change it at next login)
 and disables an account — `DELETE /users/{id}/`, which also cuts the login token.
 `PATCH /users/{id}/` with `is_active: true` turns it back on. Two things are refused, so a
 tenant can never be locked out of its own account management: nobody disables their own
 account, and the last active administrator can neither be demoted nor disabled — promote
 someone else first.
 
-A hospital can only trade with a company it has registered — that link is a
+A hospital can only trade with a company it has a link to — that link is a
 `Partnership`, and every query is filtered through it. A supplier sees the requests
 addressed to it and nothing else; it never sees another hospital's drafts, and a
 hospital never sees another hospital's requests.
+
+There are two ways to open the link. `POST /companies/` registers a company that is not on
+the platform yet, creating its account along with the link. `POST /companies/link/` with a
+`phone` opens the link to a company already there, because another hospital registered it
+first — a supplier serves as many hospitals as it likes, and nothing is created but the
+link. The phone number is what names it, which is what the company hands out.
+
+The company is not asked, on either road: knowing its phone number is the whole of the
+check, exactly as it is when a hospital registers one outright. That is a deliberate
+choice, not an oversight — if a supplier should be able to refuse a hospital, the link
+needs a pending state and an inbox to decide it from, and neither is here.
 
 ## The request lifecycle
 
@@ -105,6 +128,12 @@ DRAFT ──submit──▶ SUBMITTED ──decide──┬─▶ APPROVED ─�
    from a hospital administrator. Without it the ledger drifts away from the shelf and
    never comes back. The supplier's half of this is `POST /products/{id}/restock/`.
 
+On the company's side the same rule holds from the item's first day: a catalogue item added
+with `stock_qty` on it opens its ledger with that figure, and after that `restock/` is the
+only thing that moves it. Both sides therefore have a ledger that adds up to what is on the
+shelf, and a supplier's `stock_qty` is a running total of its own movements rather than a
+second, quietly editable figure beside them.
+
 If a company approves something and then cannot ship it, a company administrator posts
 `POST /requisitions/{id}/release/`
 with a reason, which cuts each line back to what actually went out and frees the reservation, so
@@ -121,7 +150,35 @@ python manage.py release_stale_approvals --days 14        # --dry-run to see it 
 It puts every approval older than `--days` through the same release, acting as whoever
 decided the request, so the audit trail reads the same as a manual one.
 
+Its counterpart is quieter, and deliberately so:
+
+```bash
+python manage.py stale_deliveries --days 7
+```
+
+An approval nobody ships holds stock the company could have sold, which is why the sweep
+above frees it. A consignment nobody verifies holds nothing — the goods have already left —
+but no invoice is raised until somebody says what arrived, so the company is owed money it
+cannot ask for and the hospital is holding stock its own ledger has never heard of. This
+only names them: accepting goods on a hospital's behalf would raise a real debt on nobody's
+word, so what it prints is a list to walk down the corridor about.
+
 Every state change is written to an append-only `AuditLog`.
+
+## Being told about it
+
+Nothing is sent anywhere. The platform has no mail server and no SMS account, and a
+notification table would be a second copy of figures the dashboard already counts — kept up
+to date by hand, and wrong the first time somebody forgot to write to it. So the app badges
+its own tabs from `GET /dashboard/`: requests waiting on a supplier's decision, consignments
+waiting at a hospital's door, and payments and overdue invoices behind **More**. The counts
+are refreshed when the shell is touched — on sign-in and on every tab change — so they are
+never stale by more than one tap.
+
+That means nobody is told anything while the app is shut. The two cron sweeps above are what
+covers the long silences; a real channel (email needs an address, which is optional and
+often blank, so in practice it means SMS and a provider account) is the next step if that
+turns out not to be enough.
 
 ## Batches, expiry and reorder levels
 
@@ -150,10 +207,12 @@ The platform holds no money and talks to no bank. It records the two halves of a
 that happened elsewhere, so an invoice never reads as settled on one side's word alone:
 
 ```
-                  ┌──confirm──▶ CONFIRMED   invoice.amount_paid grows
-record ──▶ PENDING┤
-                  └──reject───▶ REJECTED    nothing moves; may be recorded again
+                  ┌──confirm───▶ CONFIRMED   invoice.amount_paid grows
+record ──▶ PENDING┼──reject────▶ REJECTED    supplier: never arrived
+                  └──withdraw──▶ WITHDRAWN   hospital: taken back
 ```
+
+Neither ending moves money, and both free the reference to be recorded again.
 
 1. **Record.** A hospital administrator posts `POST /invoices/{id}/pay/` with the `amount`,
    the `method` (`TRANSFER`, `CASH`, `CHEQUE`, `POS`), a `payer_reference`, an optional
@@ -166,6 +225,12 @@ record ──▶ PENDING┤
    `amount_paid` grow and the invoice move `UNPAID` → `PART_PAID` → `PAID`.
 4. **Reject.** `POST /payments/{id}/reject/` with a `reason` if the money never arrived. The
    invoice does not move and the reference is freed, so a corrected entry can be recorded.
+5. **Withdraw.** `POST /payments/{id}/withdraw/` is the hospital's half of the same door,
+   for an entry against the wrong invoice or for the wrong amount. It works only while the
+   payment is `PENDING` — once the supplier has decided, the decision stands — and without
+   it a keying mistake would sit there holding down `amount_unclaimed` until the supplier
+   troubled itself to reject it. The withdrawn entry stays on the ledger, so the correction
+   reads as a correction.
 
 An invoice therefore carries four figures: `amount`, `amount_paid` (confirmed), `balance`
 (`amount - amount_paid`) and `amount_pending` (declared, undecided). A part payment is
@@ -173,6 +238,33 @@ ordinary — pay an invoice in as many instalments as the two sides agree.
 
 Nothing here moves money or talks to a bank. Every payment is entered by hand and confirmed
 by hand.
+
+### Credit notes
+
+Verification catches what is visible while the van is still at the door: a broken seal, a
+short count, the wrong item. It cannot catch a batch that turns out to be counterfeit, or
+one that was already three weeks from its date when it arrived, because nobody knows that
+yet. A credit note is how those are put right after the invoice was raised:
+
+```
+                       ┌──confirm──▶ CONFIRMED   invoice.amount falls, stock written down
+raise ──▶ PENDING──────┤
+                       └──reject───▶ REJECTED    nothing moves
+```
+
+A hospital administrator posts `POST /invoices/{id}/credit/` naming delivery lines, a
+quantity on each and a `reason`; `GET /invoices/{id}/creditable/` says what is still open
+after earlier notes, pending ones included, so the same carton is never credited twice. The
+supplier accepts it with `POST /credits/{id}/confirm/` or refuses it with `reject/` and a
+reason — the same two-sided rule as a payment, because it moves the same money.
+
+An accepted note takes its amount off `invoice.amount` and writes the goods out of the
+hospital's ledger as a `RETURN`. They do not go back on the supplier's shelf: bad goods are
+not stock, and where they physically end up is between the two of them.
+
+A credit is capped at what is still owed. The platform moves no money, so it cannot hand any
+back — a credit larger than the balance is a refund for the two sides to settle themselves,
+and the refusal says so.
 
 ### Terms and due dates
 
@@ -257,21 +349,23 @@ Everything lives under `/api/`. Authenticate with `Authorization: Token <key>`.
 
 | Endpoint | Purpose |
 |---|---|
+| `GET /health/` | Is the process up and can it still reach its database. No token — whatever watches it holds none |
 | `POST /auth/register/` | Public hospital sign-up (organisation + first admin) |
 | `POST /auth/login/` `POST /auth/logout/` | Phone + password session (10 attempts a minute per address; sign-up, 5 an hour) |
 | `GET/PATCH /auth/me/`, `POST /auth/change-password/` | Own account |
 | `GET/PATCH /organization/` | Own organisation profile |
 | `GET /dashboard/` | Counts, outstanding money, recent activity, and for a hospital what each department was invoiced |
-| `/companies/` | Hospital registers and manages supplier companies (administrators only; `DELETE` suspends trading, `POST /companies/{id}/reactivate/` resumes it) |
+| `/companies/` | Hospital registers and manages supplier companies (administrators only; `POST /companies/link/` with a `phone` trades with one already on the platform, `DELETE` suspends trading, `POST /companies/{id}/reactivate/` resumes it) |
 | `/users/` | Staff accounts (everyone reads; administrators write), `POST /users/{id}/reset_password/` |
 | `/departments/` | Hospital departments (everyone reads; administrators write) |
 | `/units/` | Units of those departments (`?department=<id>`; administrators write) |
-| `/products/` | Supplier catalogue (administrators write, `POST /products/{id}/restock/`); hospitals get a read-only view of partners |
+| `/products/` | Supplier catalogue — one row per generic name, brand and strength (administrators write; `stock_qty` is opening stock only, after which `POST /products/{id}/restock/` is the one way it moves); hospitals get a read-only view of partners |
 | `/requisitions/` | Requests (`?status=`, `?department=<id>` — covers its units — or `?unit=<id>`), plus `submit/`, `decide/` and `release/` (supplier administrators), `dispatch/`, `cancel/`, `wishlist/`, `wishlist/add/` |
-| `/requisition-lines/` | Line editing while the request is a draft |
+| `/requisition-lines/` | Line editing while the request is a draft. The quantity moves; the item does not — remove the line and add the other one |
 | `/deliveries/` | Consignments, plus `verify/` |
 | `/invoices/` | Invoices (`?status=`, `?overdue=true`), plus `pay/` (hospital records a payment) and `payments/` |
-| `/payments/` | Payment ledger (`?status=`, `?invoice=<id>`), plus `confirm/` and `reject/` (supplier) and `receipt/` for the attached slip |
+| `/payments/` | Payment ledger (`?status=`, `?invoice=<id>`), plus `confirm/` and `reject/` (supplier), `withdraw/` (hospital, while still pending) and `receipt/` for the attached slip |
+| `/credits/` | Credit notes (`?status=`, `?invoice=<id>`), plus `confirm/` and `reject/` (supplier). Raised at `POST /invoices/{id}/credit/`; `GET /invoices/{id}/creditable/` says what is still open |
 | `/stock-movements/` | Stock ledger (`?product=<id>`, `?kind=`, `?from=`/`?to=` as inclusive dates), plus `balances/` for the per-item totals, `dispense/` (hospital records what it handed out), `adjust/` (hospital writes stock off) and `expiring/?days=90` (the shelf check) |
 | `/audit-logs/` | Audit trail (administrators) |
 | `…/print/`, `…/print-link/` | The sheet as a PDF, and a signed ten-minute link to it for a browser — on a requisition, delivery, invoice or payment, and on the `/stock-movements/` and `/audit-logs/` lists (see Printing) |

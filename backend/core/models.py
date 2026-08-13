@@ -379,6 +379,18 @@ class Product(models.Model):
     class Meta:
         ordering = ['generic_name', 'brand']
         indexes = [models.Index(fields=['supplier', 'generic_name'])]
+        constraints = [
+            # The same thing listed twice is one catalogue nobody can total:
+            # requests split across the two rows, each with its own stock and
+            # its own price, and the hospital picks whichever it happened to
+            # find. Generic name, brand and strength are what tell two items
+            # apart — a deactivated row still holds its name, because bringing
+            # it back is how a company relists something it stopped selling.
+            models.UniqueConstraint(
+                fields=['supplier', 'generic_name', 'brand', 'strength'],
+                name='uniq_product_per_supplier',
+            ),
+        ]
 
     def __str__(self):
         return f'{self.generic_name} {self.strength}'.strip()
@@ -694,6 +706,13 @@ class PaymentStatus(models.TextChoices):
     PENDING = 'PENDING', 'Recorded, awaiting the supplier'
     CONFIRMED = 'CONFIRMED', 'Confirmed received'
     REJECTED = 'REJECTED', 'Not received'
+    WITHDRAWN = 'WITHDRAWN', 'Withdrawn by the hospital'
+
+
+#: A payment that never went anywhere: the hospital took it back or the supplier
+#: says it never arrived. Neither counts against the invoice, and neither holds
+#: on to the transaction reference it was recorded under.
+PAYMENT_DEAD_STATUSES = [PaymentStatus.REJECTED, PaymentStatus.WITHDRAWN]
 
 
 class Payment(models.Model):
@@ -738,17 +757,84 @@ class Payment(models.Model):
         indexes = [models.Index(fields=['invoice', 'status'])]
         constraints = [
             # The same teller slip entered twice against one invoice is a
-            # keying mistake, not a second payment. Blank is only cash, and a
-            # rejected entry frees its reference to be recorded again.
+            # keying mistake, not a second payment. Blank is only cash, and an
+            # entry that came to nothing — withdrawn or rejected — frees its
+            # reference to be recorded again.
             models.UniqueConstraint(
                 fields=['invoice', 'payer_reference'],
-                condition=~models.Q(payer_reference='') & ~models.Q(status=PaymentStatus.REJECTED),
+                condition=(
+                    ~models.Q(payer_reference='')
+                    & ~models.Q(status__in=PAYMENT_DEAD_STATUSES)
+                ),
                 name='uniq_payer_reference_per_invoice',
             ),
         ]
 
     def __str__(self):
         return f'{self.reference} {self.amount} ({self.get_status_display()})'
+
+
+class CreditStatus(models.TextChoices):
+    PENDING = 'PENDING', 'Raised, awaiting the supplier'
+    CONFIRMED = 'CONFIRMED', 'Accepted by the supplier'
+    REJECTED = 'REJECTED', 'Refused by the supplier'
+
+
+class CreditNote(models.Model):
+    """Goods accepted at the door and found bad afterwards.
+
+    Verification catches what is visible while the delivery van is still there:
+    a broken seal, a short count, the wrong item. It cannot catch a batch that
+    turns out to be counterfeit, or one that was already three weeks from its
+    date when it arrived, because nobody knows that yet. Until this existed the
+    invoice was final from the moment it was raised, and the only recourse was
+    to write the stock off with an adjustment and argue about the money
+    somewhere off the platform.
+
+    Shaped like a payment on purpose, and for the same reason: it moves what one
+    side owes the other, so it takes both of them. The hospital raises it, the
+    supplier accepts or refuses, and only an accepted one touches the invoice.
+    """
+
+    reference = models.CharField(max_length=16, unique=True, default=new_reference)
+    invoice = models.ForeignKey(Invoice, on_delete=models.CASCADE, related_name='credits')
+    amount = models.DecimalField(max_digits=14, decimal_places=2, default=Decimal('0.00'))
+    status = models.CharField(
+        max_length=10, choices=CreditStatus.choices, default=CreditStatus.PENDING,
+    )
+    reason = models.CharField(max_length=255)
+    raised_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, null=True, on_delete=models.SET_NULL,
+        related_name='credits_raised',
+    )
+    raised_at = models.DateTimeField(auto_now_add=True)
+    decided_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL,
+        related_name='credits_decided',
+    )
+    decided_at = models.DateTimeField(null=True, blank=True)
+    reject_reason = models.CharField(max_length=255, blank=True)
+
+    class Meta:
+        ordering = ['-raised_at']
+        indexes = [models.Index(fields=['invoice', 'status'])]
+
+    def __str__(self):
+        return f'{self.reference} {self.amount} ({self.get_status_display()})'
+
+
+class CreditNoteLine(models.Model):
+    credit_note = models.ForeignKey(CreditNote, on_delete=models.CASCADE, related_name='lines')
+    delivery_line = models.ForeignKey(
+        DeliveryLine, on_delete=models.CASCADE, related_name='credit_lines',
+    )
+    qty = quantity_field()
+
+    class Meta:
+        ordering = ['id']
+
+    def __str__(self):
+        return f'{self.delivery_line.requisition_line.product} x{self.qty}'
 
 
 class StockMovement(models.Model):

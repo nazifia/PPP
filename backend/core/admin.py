@@ -7,6 +7,7 @@ from django.shortcuts import redirect, render
 
 from .models import (
     AuditLog,
+    CreditNote,
     Delivery,
     DeliveryLine,
     Department,
@@ -90,6 +91,13 @@ class PaymentAdmin(admin.ModelAdmin):
 class AuditLogAdmin(admin.ModelAdmin):
     list_display = ['created_at', 'organization', 'actor', 'action', 'entity', 'entity_id']
     list_filter = ['action', 'entity']
+
+
+@admin.register(CreditNote)
+class CreditNoteAdmin(admin.ModelAdmin):
+    list_display = ['reference', 'invoice', 'amount', 'status', 'raised_at']
+    list_filter = ['status']
+    search_fields = ['reference', 'reason', 'invoice__reference']
 
 
 admin.site.register(

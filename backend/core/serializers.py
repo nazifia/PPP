@@ -10,6 +10,8 @@ from rest_framework import serializers
 
 from .models import (
     AuditLog,
+    CreditNote,
+    CreditNoteLine,
     Delivery,
     DeliveryLine,
     Department,
@@ -63,6 +65,23 @@ class QuantityField(serializers.DecimalField):
         return value
 
 
+def unique_org_phone(value, instance=None):
+    """A phone number nobody else holds, in the form it will be stored in.
+
+    `Organization.save` normalises on the way into the database, so the clash
+    has to be looked for in the same form. The field's own uniqueness check
+    reads the raw text, so `0803 123-4567` passes it and then collides on save
+    — a 500 where a plain refusal belongs. `User` has the same guard.
+    """
+    phone = normalize_phone(value)
+    clash = Organization.objects.filter(phone=phone)
+    if instance is not None:
+        clash = clash.exclude(pk=instance.pk)
+    if clash.exists():
+        raise serializers.ValidationError('An organisation with that phone already exists.')
+    return phone
+
+
 class OrganizationSerializer(serializers.ModelSerializer):
     class Meta:
         model = Organization
@@ -72,6 +91,9 @@ class OrganizationSerializer(serializers.ModelSerializer):
             'is_active', 'created_at',
         ]
         read_only_fields = ['kind', 'created_at']
+
+    def validate_phone(self, value):
+        return unique_org_phone(value, self.instance)
 
 
 class UserSerializer(serializers.ModelSerializer):
@@ -159,10 +181,7 @@ class HospitalRegisterSerializer(serializers.Serializer):
     password = serializers.CharField(write_only=True, validators=[validate_password])
 
     def validate_phone(self, value):
-        phone = normalize_phone(value)
-        if Organization.objects.filter(phone=phone).exists():
-            raise serializers.ValidationError('An organisation with that phone already exists.')
-        return phone
+        return unique_org_phone(value)
 
     def validate_admin_phone(self, value):
         phone = normalize_phone(value)
@@ -209,6 +228,9 @@ class CompanySerializer(serializers.ModelSerializer):
         # Suspending trade is DELETE, which flips the partnership instead.
         read_only_fields = ['kind', 'is_active', 'created_at']
 
+    def validate_phone(self, value):
+        return unique_org_phone(value, self.instance)
+
 
 class CompanyCreateSerializer(serializers.Serializer):
     """A hospital registers a supplier company and its login account."""
@@ -224,10 +246,7 @@ class CompanyCreateSerializer(serializers.Serializer):
     password = serializers.CharField(write_only=True, validators=[validate_password])
 
     def validate_phone(self, value):
-        phone = normalize_phone(value)
-        if Organization.objects.filter(phone=phone).exists():
-            raise serializers.ValidationError('A company with that phone already exists.')
-        return phone
+        return unique_org_phone(value)
 
     def validate_contact_phone(self, value):
         phone = normalize_phone(value)
@@ -357,23 +376,79 @@ class ProductSerializer(serializers.ModelSerializer):
             'reorder_level', 'is_low_stock', 'is_active', 'availability', 'updated_at',
         ]
         read_only_fields = ['supplier', 'qty_reserved']
+        # `uniq_product_per_supplier` names `supplier`, which is not in the
+        # payload, so the validator DRF builds from it cannot run — and building
+        # it makes every other field it names mandatory, so an item could no
+        # longer be added without a brand and a strength. `validate` below is
+        # that constraint stated in a form that knows where the supplier
+        # comes from.
+        validators = []
 
     def get_formulation_name(self, product):
         """Empty rather than absent, since an item may name no form at all."""
         return product.formulation.name if product.formulation_id else ''
 
-    def _check_own(self, term):
-        """Nobody describes an item with a term another company defined."""
+    def _check_own(self, term, field):
+        """Nobody describes an item with a term another company defined.
+
+        Nor with one that has been retired — that is what retiring it is for.
+        An item already described by it keeps it, so editing that item's price
+        is not made impossible by a word going out of use underneath it; only
+        moving an item onto a retired term is refused.
+        """
         user = self.context['request'].user
         if not visible_terms(user, type(term)).filter(pk=term.pk).exists():
             raise serializers.ValidationError('That belongs to another company.')
+        keeping = (
+            self.instance is not None
+            and getattr(self.instance, f'{field}_id') == term.pk
+        )
+        if not term.is_active and not keeping:
+            raise serializers.ValidationError(f'{term.name} has been retired.')
         return term
 
+    def validate_stock_qty(self, value):
+        """Opening stock only. After that, `restock` is the only way it moves.
+
+        An edit here would write no StockMovement, so the ledger would stop
+        agreeing with the shelf, and it would walk past the check that stock
+        cannot fall below what is already promised to approved requests. An
+        unchanged figure is allowed through, so sending the whole row back
+        still works.
+        """
+        if self.instance is not None and value != self.instance.stock_qty:
+            raise serializers.ValidationError(
+                'Stock moves through restock, which records it in the ledger.'
+            )
+        return value
+
+    def validate(self, attrs):
+        """The one-row-per-item rule, in words rather than as a database error.
+
+        `supplier` comes from the caller rather than the payload, so the
+        constraint on the model cannot be checked by the field validators the
+        way an ordinary unique_together would be.
+        """
+        instance = self.instance
+        supplier = instance.supplier if instance else self.context['request'].user.scope_org
+        named = {
+            field: attrs.get(field, getattr(instance, field, '') if instance else '')
+            for field in ('generic_name', 'brand', 'strength')
+        }
+        clash = Product.objects.filter(supplier=supplier, **named)
+        if instance is not None:
+            clash = clash.exclude(pk=instance.pk)
+        if clash.exists():
+            raise serializers.ValidationError(
+                'That item is already in your catalogue. Edit that row, or restock it.'
+            )
+        return attrs
+
     def validate_unit(self, value):
-        return self._check_own(value)
+        return self._check_own(value, 'unit')
 
     def validate_formulation(self, value):
-        return value if value is None else self._check_own(value)
+        return value if value is None else self._check_own(value, 'formulation')
 
 
 def check_unit_in_department(department, unit):
@@ -605,6 +680,56 @@ class PaymentSerializer(serializers.ModelSerializer):
         return request.build_absolute_uri(url) if request else url
 
 
+class CreditNoteLineSerializer(serializers.ModelSerializer):
+    product_name = serializers.CharField(
+        source='delivery_line.requisition_line.product.__str__', read_only=True,
+    )
+    unit_price = serializers.DecimalField(
+        source='delivery_line.requisition_line.unit_price',
+        max_digits=12, decimal_places=2, read_only=True,
+    )
+    qty = QuantityField(read_only=True)
+
+    class Meta:
+        model = CreditNoteLine
+        fields = ['id', 'delivery_line', 'product_name', 'unit_price', 'qty']
+
+
+class CreditNoteSerializer(serializers.ModelSerializer):
+    lines = CreditNoteLineSerializer(many=True, read_only=True)
+    invoice_reference = serializers.CharField(source='invoice.reference', read_only=True)
+    hospital_name = serializers.CharField(source='invoice.hospital.name', read_only=True)
+    supplier_name = serializers.CharField(source='invoice.supplier.name', read_only=True)
+    raised_by_name = serializers.CharField(source='raised_by.full_name', read_only=True)
+    decided_by_name = serializers.CharField(source='decided_by.full_name', read_only=True)
+
+    class Meta:
+        model = CreditNote
+        fields = [
+            'id', 'reference', 'invoice', 'invoice_reference', 'hospital_name',
+            'supplier_name', 'amount', 'status', 'reason', 'raised_by', 'raised_by_name',
+            'raised_at', 'decided_by', 'decided_by_name', 'decided_at', 'reject_reason',
+            'lines',
+        ]
+        read_only_fields = fields
+
+
+class CreditItemSerializer(serializers.Serializer):
+    line = serializers.IntegerField()
+    qty = QuantityField(min_value=HALF_UNIT)
+
+
+class RaiseCreditSerializer(serializers.Serializer):
+    """What the hospital says was wrong with goods it had already accepted."""
+
+    lines = CreditItemSerializer(many=True)
+    reason = serializers.CharField(max_length=255)
+
+
+class RejectCreditSerializer(serializers.Serializer):
+    reason = serializers.CharField(max_length=255)
+
+
 class InvoiceDetailSerializer(InvoiceSerializer):
     """The invoice with its ledger attached, for a screen that shows both.
 
@@ -613,9 +738,10 @@ class InvoiceDetailSerializer(InvoiceSerializer):
     """
 
     payments = PaymentSerializer(many=True, read_only=True)
+    credits = CreditNoteSerializer(many=True, read_only=True)
 
     class Meta(InvoiceSerializer.Meta):
-        fields = [*InvoiceSerializer.Meta.fields, 'payments']
+        fields = [*InvoiceSerializer.Meta.fields, 'payments', 'credits']
         read_only_fields = fields
 
 
