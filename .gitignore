@@ -13,3 +13,4 @@ frontend/.firebase/
 frontend/.flutter-plugins*
 
 .idea/
+.serena/
