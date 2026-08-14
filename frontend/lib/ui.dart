@@ -318,6 +318,132 @@ void showDone(BuildContext context, String message) {
   ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(message)));
 }
 
+/// A dropdown that can be typed into: the list filters on any part of a
+/// label, not just the start. Replaces [DropdownButtonFormField], which has no
+/// way in and makes a long list of products or departments a scrolling hunt.
+class PickerField<T> extends StatefulWidget {
+  const PickerField({
+    super.key,
+    required this.label,
+    required this.entries,
+    required this.onSelected,
+    this.value,
+    this.helperText,
+    this.enabled = true,
+    this.width,
+    this.searchFrom = 6,
+    this.search,
+  });
+
+  final String label;
+
+  /// What the list starts as. With [search] set, the server replaces it as the
+  /// user types.
+  final List<DropdownMenuEntry<T>> entries;
+  final ValueChanged<T?> onSelected;
+  final T? value;
+  final String? helperText;
+  final bool enabled;
+
+  /// Unset means fill whatever the parent gives it.
+  final double? width;
+
+  /// Typing into a handful of options is slower than reading them, so the
+  /// keyboard only opens once the list is at least this long. [search] opens
+  /// it whatever the length, since the loaded list is not the whole list.
+  final int searchFrom;
+
+  /// Asks the server for the options matching a query, instead of filtering
+  /// the rows already loaded. Endpoints page at 25 rows, so a picker that only
+  /// filters what it was handed cannot reach the 26th department. Unset for a
+  /// list the server sends whole.
+  final Future<List<DropdownMenuEntry<T>>> Function(String query)? search;
+
+  @override
+  State<PickerField<T>> createState() => _PickerFieldState<T>();
+}
+
+class _PickerFieldState<T> extends State<PickerField<T>> {
+  final _text = TextEditingController();
+  late List<DropdownMenuEntry<T>> _entries = widget.entries;
+  Timer? _debounce;
+  String _query = '';
+
+  /// Every query in flight is numbered, so a slow early one landing after a
+  /// later one cannot put stale options back on screen.
+  int _latest = 0;
+
+  @override
+  void initState() {
+    super.initState();
+    if (widget.search != null) _text.addListener(_onTyped);
+  }
+
+  @override
+  void didUpdateWidget(PickerField<T> old) {
+    super.didUpdateWidget(old);
+    // A fresh list from the caller — a reload, an entry just added — wins over
+    // whatever the last query returned.
+    if (!identical(old.entries, widget.entries)) _entries = widget.entries;
+  }
+
+  @override
+  void dispose() {
+    _debounce?.cancel();
+    _text.dispose();
+    super.dispose();
+  }
+
+  void _onTyped() {
+    final query = _text.text.trim();
+    // Picking an option writes its label into the field. That is an answer,
+    // not a question, so it costs no request.
+    if (query == _query || _entries.any((entry) => entry.label == query)) {
+      _query = query;
+      return;
+    }
+    _query = query;
+    _debounce?.cancel();
+    _debounce = Timer(const Duration(milliseconds: 300), () => _fetch(query));
+  }
+
+  Future<void> _fetch(String query) async {
+    final generation = ++_latest;
+    try {
+      final entries = await widget.search!(query);
+      if (mounted && generation == _latest) setState(() => _entries = entries);
+    } catch (_) {
+      // A query that fails leaves the last good list up rather than emptying
+      // the menu under the user mid-type.
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final remote = widget.search != null;
+    final searchable = widget.enabled && (remote || _entries.length >= widget.searchFrom);
+    return DropdownMenu<T>(
+      controller: remote ? _text : null,
+      initialSelection: widget.value,
+      enabled: widget.enabled,
+      label: Text(widget.label),
+      helperText: widget.helperText,
+      width: widget.width,
+      // Fills the parent's width when no width is given, the way the form
+      // fields beside it do.
+      expandedInsets: widget.width == null ? EdgeInsets.zero : null,
+      menuHeight: 320,
+      // The server has already filtered a remote list; filtering it again
+      // locally would hide rows it matched on a field the label does not show.
+      enableFilter: searchable && !remote,
+      requestFocusOnTap: searchable,
+      inputDecorationTheme: Theme.of(context).inputDecorationTheme.copyWith(isDense: true),
+      dropdownMenuEntries: _entries,
+      onSelected: widget.onSelected,
+    );
+  }
+}
+
 /// A search box that filters as the user types. [onChanged] fires once the
 /// typing pauses, not once per keystroke, so a fast typist costs one request.
 class DebouncedSearch extends StatelessWidget {

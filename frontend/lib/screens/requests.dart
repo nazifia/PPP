@@ -8,13 +8,33 @@ import 'more.dart';
 
 /// Departments and units in one picker. Each option carries the field name the
 /// API wants with it, because the two are separate resources: 'department:3'.
-Future<List<Map<String, dynamic>>> tagOptions(Api api) async {
-  final lists = await Future.wait([api.list('/departments/'), api.list('/units/')]);
+/// [query] is passed to the server, which searches unit names by department
+/// name too — reach the 26th department, which the first page never carries.
+Future<List<Map<String, dynamic>>> tagOptions(Api api, [String query = '']) async {
+  final search = {if (query.isNotEmpty) 'search': query};
+  final lists = await Future.wait([
+    api.list('/departments/', search),
+    api.list('/units/', search),
+  ]);
   return [
     for (final row in lists[0]) {'key': 'department:${row['id']}', 'label': '${row['name']}'},
     for (final row in lists[1]) {'key': 'unit:${row['id']}', 'label': '${row['full_name']}'},
   ]..sort((a, b) => '${a['label']}'.compareTo('${b['label']}'));
 }
+
+/// The picker options for [tagOptions] rows. [placeholder], when given, is the
+/// 'no particular department' entry, and survives every query.
+List<DropdownMenuEntry<String?>> tagEntries(
+  List<Map<String, dynamic>> rows, {
+  String? placeholder,
+}) => [
+  if (placeholder != null) DropdownMenuEntry(value: null, label: placeholder),
+  for (final row in rows) DropdownMenuEntry(value: '${row['key']}', label: '${row['label']}'),
+];
+
+List<DropdownMenuEntry<int?>> companyEntries(List<Map<String, dynamic>> rows) => [
+  for (final row in rows) DropdownMenuEntry(value: row['id'] as int, label: '${row['name']}'),
+];
 
 /// Turns 'department:3' back into the pair a query or request body needs.
 Map<String, dynamic> tagField(String? tag) {
@@ -170,22 +190,13 @@ class _RequestsScreenState extends State<RequestsScreen> {
                     if (rows.isEmpty) return const SizedBox.shrink();
                     return Padding(
                       padding: const EdgeInsets.fromLTRB(12, 0, 12, 8),
-                      child: DropdownButtonFormField<String?>(
-                        initialValue: _tag,
-                        isExpanded: true,
-                        decoration: const InputDecoration(
-                          labelText: 'Department / unit',
-                          isDense: true,
-                        ),
-                        items: [
-                          const DropdownMenuItem(value: null, child: Text('All departments')),
-                          for (final row in rows)
-                            DropdownMenuItem(
-                              value: '${row['key']}',
-                              child: Text('${row['label']}', overflow: TextOverflow.ellipsis),
-                            ),
-                        ],
-                        onChanged: (value) {
+                      child: PickerField<String?>(
+                        label: 'Department / unit',
+                        value: _tag,
+                        entries: tagEntries(rows, placeholder: 'All departments'),
+                        search: (query) async =>
+                            tagEntries(await tagOptions(api, query), placeholder: 'All departments'),
+                        onSelected: (value) {
                           setState(() => _tag = value);
                           _controller.reload();
                         },
@@ -284,35 +295,21 @@ class _NewRequestDialogState extends State<_NewRequestDialog> {
               child: Column(
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  DropdownButtonFormField<int>(
-                    initialValue: _supplier,
-                    isExpanded: true,
-                    decoration: const InputDecoration(labelText: 'Company', isDense: true),
-                    items: [
-                      for (final company in companies)
-                        DropdownMenuItem(
-                          value: company['id'] as int,
-                          child: Text('${company['name']}', overflow: TextOverflow.ellipsis),
-                        ),
-                    ],
-                    onChanged: (value) => setState(() => _supplier = value),
+                  PickerField<int?>(
+                    label: 'Company',
+                    value: _supplier,
+                    entries: companyEntries(companies),
+                    search: (query) async =>
+                        companyEntries(await api.list('/companies/', {'search': query})),
+                    onSelected: (value) => setState(() => _supplier = value),
                   ),
                   const SizedBox(height: 12),
-                  DropdownButtonFormField<String>(
-                    initialValue: _tag,
-                    isExpanded: true,
-                    decoration: const InputDecoration(
-                      labelText: 'Department / unit',
-                      isDense: true,
-                    ),
-                    items: [
-                      for (final tag in tags)
-                        DropdownMenuItem(
-                          value: '${tag['key']}',
-                          child: Text('${tag['label']}', overflow: TextOverflow.ellipsis),
-                        ),
-                    ],
-                    onChanged: (value) => setState(() => _tag = value),
+                  PickerField<String?>(
+                    label: 'Department / unit',
+                    value: _tag,
+                    entries: tagEntries(tags),
+                    search: (query) async => tagEntries(await tagOptions(api, query)),
+                    onSelected: (value) => setState(() => _tag = value),
                   ),
                   const SizedBox(height: 12),
                   TextField(
@@ -675,19 +672,13 @@ class _RequestDetailScreenState extends State<RequestDetailScreen> {
         content: SizedBox(
           width: dialogWidth(context, 360),
           child: StatefulBuilder(
-            builder: (context, setState) => DropdownButtonFormField<String>(
-              initialValue: tag,
-              isExpanded: true,
-              decoration: const InputDecoration(labelText: 'Department / unit', isDense: true),
-              items: [
-                const DropdownMenuItem(value: null, child: Text('Not specified')),
-                for (final option in tags)
-                  DropdownMenuItem(
-                    value: '${option['key']}',
-                    child: Text('${option['label']}', overflow: TextOverflow.ellipsis),
-                  ),
-              ],
-              onChanged: (value) => setState(() => tag = value),
+            builder: (context, setState) => PickerField<String?>(
+              label: 'Department / unit',
+              value: tag,
+              entries: tagEntries(tags, placeholder: 'Not specified'),
+              search: (query) async =>
+                  tagEntries(await tagOptions(api, query), placeholder: 'Not specified'),
+              onSelected: (value) => setState(() => tag = value),
             ),
           ),
         ),

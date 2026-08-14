@@ -205,15 +205,17 @@ class _AutoSignOutTile extends StatelessWidget {
             ? 'Your organisation caps this at ${policy.inMinutes} min, so that is what applies'
             : 'Ends the session after this long without activity',
       ),
-      trailing: DropdownButton<Duration>(
+      trailing: PickerField<Duration?>(
+        label: 'After',
         value: api.deviceIdleTimeout,
+        width: 132,
         // A value from an older build or a --dart-define may not be on the
         // list; showing it keeps the dropdown from asserting on it.
-        items: [
+        entries: [
           for (final choice in {...idleTimeoutChoices, api.deviceIdleTimeout})
-            DropdownMenuItem(value: choice, child: Text('${choice.inMinutes} min')),
+            DropdownMenuEntry(value: choice, label: '${choice.inMinutes} min'),
         ],
-        onChanged: (choice) => choice == null ? null : api.setIdleTimeout(choice),
+        onSelected: (choice) => choice == null ? null : api.setIdleTimeout(choice),
       ),
     );
   }
@@ -413,17 +415,16 @@ class _CompanyDialogState extends State<_CompanyDialog> {
                     ),
                   ),
                 ),
-              DropdownButtonFormField<String>(
-                initialValue: _category,
-                isExpanded: true,
-                decoration: const InputDecoration(labelText: 'What they supply', isDense: true),
-                items: const [
-                  DropdownMenuItem(value: 'PHARMACY', child: Text('Medicines / pharmacy')),
-                  DropdownMenuItem(value: 'LABORATORY', child: Text('Laboratory reagents')),
-                  DropdownMenuItem(value: 'CONSUMABLES', child: Text('Medical consumables')),
-                  DropdownMenuItem(value: 'MIXED', child: Text('Mixed')),
+              PickerField<String?>(
+                label: 'What they supply',
+                value: _category,
+                entries: const [
+                  DropdownMenuEntry(value: 'PHARMACY', label: 'Medicines / pharmacy'),
+                  DropdownMenuEntry(value: 'LABORATORY', label: 'Laboratory reagents'),
+                  DropdownMenuEntry(value: 'CONSUMABLES', label: 'Medical consumables'),
+                  DropdownMenuEntry(value: 'MIXED', label: 'Mixed'),
                 ],
-                onChanged: (value) => setState(() => _category = value ?? 'PHARMACY'),
+                onSelected: (value) => setState(() => _category = value ?? 'PHARMACY'),
               ),
             ],
           ),
@@ -903,15 +904,14 @@ class _UserDialogState extends State<_UserDialog> {
                     ),
                   ),
                 ),
-              DropdownButtonFormField<String>(
-                initialValue: _role,
-                isExpanded: true,
-                decoration: const InputDecoration(labelText: 'Role', isDense: true),
-                items: const [
-                  DropdownMenuItem(value: 'STAFF', child: Text('Staff')),
-                  DropdownMenuItem(value: 'ADMIN', child: Text('Administrator')),
+              PickerField<String?>(
+                label: 'Role',
+                value: _role,
+                entries: const [
+                  DropdownMenuEntry(value: 'STAFF', label: 'Staff'),
+                  DropdownMenuEntry(value: 'ADMIN', label: 'Administrator'),
                 ],
-                onChanged: (value) => setState(() => _role = value ?? 'STAFF'),
+                onSelected: (value) => setState(() => _role = value ?? 'STAFF'),
               ),
             ],
           ),
@@ -1179,14 +1179,14 @@ class _RecordPaymentDialogState extends State<RecordPaymentDialog> {
             ),
           ),
           const SizedBox(height: 12),
-          DropdownButtonFormField<String>(
-            initialValue: _method,
-            decoration: const InputDecoration(labelText: 'How it was paid'),
-            items: [
+          PickerField<String?>(
+            label: 'How it was paid',
+            value: _method,
+            entries: [
               for (final entry in methods.entries)
-                DropdownMenuItem(value: entry.key, child: Text(entry.value)),
+                DropdownMenuEntry(value: entry.key, label: entry.value),
             ],
-            onChanged: (value) => setState(() => _method = value ?? _method),
+            onSelected: (value) => setState(() => _method = value ?? _method),
           ),
           const SizedBox(height: 12),
           TextField(
@@ -2148,6 +2148,36 @@ class _StockLedgerScreenState extends State<StockLedgerScreen> {
   }
 }
 
+/// What the ledger says this hospital holds, item by item. [query] is searched
+/// by the server across the product name and brand; [inStock] drops the items
+/// run down to nothing, which cannot be dispensed but can still be corrected.
+Future<List<Map<String, dynamic>>> _balances(
+  Api api, {
+  String query = '',
+  bool inStock = false,
+}) async {
+  final rows = await api.list('/stock-movements/balances/', {
+    if (query.isNotEmpty) 'search': query,
+  });
+  if (!inStock) return rows;
+  return [
+    for (final row in rows)
+      if (qty(row['balance']) > 0) row,
+  ];
+}
+
+/// The picker options for [_balances] rows. [suffix] says what the number is.
+List<DropdownMenuEntry<Object?>> _balanceEntries(
+  List<Map<String, dynamic>> rows,
+  String suffix,
+) => [
+  for (final row in rows)
+    DropdownMenuEntry<Object?>(
+      value: row['product'],
+      label: '${row['product_name']} · ${qtyText(row['balance'])} $suffix',
+    ),
+];
+
 /// Records what a ward handed out. The picker offers only what the ledger says
 /// the hospital still holds, so the commonest mistake cannot be typed at all.
 class _DispenseDialog extends StatefulWidget {
@@ -2170,7 +2200,7 @@ class _DispenseDialogState extends State<_DispenseDialog> {
   void initState() {
     super.initState();
     _product = widget.product;
-    _held = ApiScope.of(context).list('/stock-movements/balances/');
+    _held = _balances(ApiScope.of(context), inStock: true);
   }
 
   @override
@@ -2218,10 +2248,7 @@ class _DispenseDialogState extends State<_DispenseDialog> {
               return const SizedBox(height: 80, child: Center(child: CircularProgressIndicator()));
             }
             if (snapshot.hasError) return Text('${snapshot.error}');
-            final stocked = [
-              for (final row in snapshot.data!)
-                if (qty(row['balance']) > 0) row,
-            ];
+            final stocked = snapshot.data!;
             if (stocked.isEmpty) {
               return const Text('Nothing in stock to dispense.');
             }
@@ -2229,23 +2256,15 @@ class _DispenseDialogState extends State<_DispenseDialog> {
               child: Column(
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  DropdownButtonFormField<Object>(
-                    initialValue: stocked.any((row) => row['product'] == _product)
-                        ? _product
-                        : null,
-                    isExpanded: true,
-                    decoration: const InputDecoration(labelText: 'Item'),
-                    items: [
-                      for (final row in stocked)
-                        DropdownMenuItem<Object>(
-                          value: row['product'],
-                          child: Text(
-                            '${row['product_name']} · ${qtyText(row['balance'])} left',
-                            overflow: TextOverflow.ellipsis,
-                          ),
-                        ),
-                    ],
-                    onChanged: (value) => setState(() => _product = value),
+                  PickerField<Object?>(
+                    label: 'Item',
+                    value: stocked.any((row) => row['product'] == _product) ? _product : null,
+                    entries: _balanceEntries(stocked, 'left'),
+                    search: (query) async => _balanceEntries(
+                      await _balances(ApiScope.of(context), query: query, inStock: true),
+                      'left',
+                    ),
+                    onSelected: (value) => setState(() => _product = value),
                   ),
                   const SizedBox(height: 12),
                   TextField(
@@ -2307,7 +2326,7 @@ class _AdjustDialogState extends State<_AdjustDialog> {
     // run down to nothing: a miscount is corrected upwards as often as down.
     // An item with no history at all is one this hospital never received, and
     // the server refuses it.
-    _held = ApiScope.of(context).list('/stock-movements/balances/');
+    _held = _balances(ApiScope.of(context));
   }
 
   @override
@@ -2367,21 +2386,15 @@ class _AdjustDialogState extends State<_AdjustDialog> {
               child: Column(
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  DropdownButtonFormField<Object>(
-                    initialValue: rows.any((row) => row['product'] == _product) ? _product : null,
-                    isExpanded: true,
-                    decoration: const InputDecoration(labelText: 'Item'),
-                    items: [
-                      for (final row in rows)
-                        DropdownMenuItem<Object>(
-                          value: row['product'],
-                          child: Text(
-                            '${row['product_name']} · ${qtyText(row['balance'])} on the books',
-                            overflow: TextOverflow.ellipsis,
-                          ),
-                        ),
-                    ],
-                    onChanged: (value) => setState(() => _product = value),
+                  PickerField<Object?>(
+                    label: 'Item',
+                    value: rows.any((row) => row['product'] == _product) ? _product : null,
+                    entries: _balanceEntries(rows, 'on the books'),
+                    search: (query) async => _balanceEntries(
+                      await _balances(ApiScope.of(context), query: query),
+                      'on the books',
+                    ),
+                    onSelected: (value) => setState(() => _product = value),
                   ),
                   const SizedBox(height: 12),
                   TextField(

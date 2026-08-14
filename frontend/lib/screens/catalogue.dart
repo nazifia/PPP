@@ -103,22 +103,13 @@ class _CatalogueScreenState extends State<CatalogueScreen> {
                   builder: (context, snapshot) {
                     final tags = snapshot.data ?? const <Map<String, dynamic>>[];
                     if (tags.isEmpty) return const SizedBox.shrink();
-                    return DropdownButtonFormField<String>(
-                      initialValue: _tag,
-                      isExpanded: true,
-                      decoration: const InputDecoration(
-                        labelText: 'Requesting for (department / unit)',
-                        isDense: true,
-                      ),
-                      items: [
-                        const DropdownMenuItem(value: null, child: Text('Not specified')),
-                        for (final tag in tags)
-                          DropdownMenuItem(
-                            value: '${tag['key']}',
-                            child: Text('${tag['label']}', overflow: TextOverflow.ellipsis),
-                          ),
-                      ],
-                      onChanged: (value) => setState(() => _tag = value),
+                    return PickerField<String?>(
+                      label: 'Requesting for (department / unit)',
+                      value: _tag,
+                      entries: tagEntries(tags, placeholder: 'Not specified'),
+                      search: (query) async =>
+                          tagEntries(await tagOptions(api, query), placeholder: 'Not specified'),
+                      onSelected: (value) => setState(() => _tag = value),
                     );
                   },
                 ),
@@ -278,45 +269,49 @@ class _CatalogueScreenState extends State<CatalogueScreen> {
   }
 }
 
-class _CompanyFilter extends StatelessWidget {
+/// Which company's catalogue to browse. A picker rather than a row of chips:
+/// the company list pages at 25, and a chip is only ever drawn for a row that
+/// arrived, so a hospital with more suppliers than that could not reach the
+/// rest. Typing asks the server by name instead.
+class _CompanyFilter extends StatefulWidget {
   const _CompanyFilter({required this.value, required this.onChanged});
 
+  /// The supplier id as the product query wants it, empty for every company.
   final String value;
   final ValueChanged<String> onChanged;
+
+  @override
+  State<_CompanyFilter> createState() => _CompanyFilterState();
+}
+
+class _CompanyFilterState extends State<_CompanyFilter> {
+  /// Held, not asked for again on every rebuild: the screen rebuilds on each
+  /// keystroke in the search box above it.
+  late final Future<List<Map<String, dynamic>>> _companies =
+      ApiScope.of(context).list('/companies/');
+
+  List<DropdownMenuEntry<int?>> _entries(List<Map<String, dynamic>> companies) => [
+    const DropdownMenuEntry(value: null, label: 'All companies'),
+    ...companyEntries(companies),
+  ];
 
   @override
   Widget build(BuildContext context) {
     final api = ApiScope.of(context);
     return FutureBuilder<List<Map<String, dynamic>>>(
-      future: api.list('/companies/'),
+      future: _companies,
       builder: (context, snapshot) {
         final companies = snapshot.data ?? const <Map<String, dynamic>>[];
         if (companies.isEmpty) return const SizedBox.shrink();
         return Bounded(
-          child: SizedBox(
-            height: 44,
-            child: ListView(
-              scrollDirection: Axis.horizontal,
-              padding: const EdgeInsets.symmetric(horizontal: 12),
-              children: [
-                Padding(
-                  padding: const EdgeInsets.only(right: 6),
-                  child: ChoiceChip(
-                    label: const Text('All companies'),
-                    selected: value.isEmpty,
-                    onSelected: (_) => onChanged(''),
-                  ),
-                ),
-                for (final company in companies)
-                  Padding(
-                    padding: const EdgeInsets.only(right: 6),
-                    child: ChoiceChip(
-                      label: Text('${company['name']}'),
-                      selected: value == '${company['id']}',
-                      onSelected: (_) => onChanged('${company['id']}'),
-                    ),
-                  ),
-              ],
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(12, 4, 12, 4),
+            child: PickerField<int?>(
+              label: 'Company',
+              value: int.tryParse(widget.value),
+              entries: _entries(companies),
+              search: (query) async => _entries(await api.list('/companies/', {'search': query})),
+              onSelected: (id) => widget.onChanged(id?.toString() ?? ''),
             ),
           ),
         );
@@ -507,38 +502,41 @@ class _ProductDialogState extends State<_ProductDialog> {
     }
   }
 
+  /// The options of one term list: the entries themselves, plus the two that
+  /// are not entries at all and so survive every query — 'none of these', and
+  /// the row that defines a new one.
+  List<DropdownMenuEntry<int?>> _termEntries(
+    _TermPicker picker,
+    List<Map<String, dynamic>> rows,
+  ) => [
+    if (picker.optional) const DropdownMenuEntry(value: null, label: '—'),
+    for (final row in rows) DropdownMenuEntry(value: row['id'] as int, label: '${row['name']}'),
+    const DropdownMenuEntry(value: _newTerm, label: 'New…'),
+  ];
+
   /// Picked, never typed: a catalogue selling the same thing in PACK and in
   /// Packs cannot be totalled.
   Widget _termField(_TermPicker picker) {
     return Padding(
       padding: const EdgeInsets.only(bottom: 10),
-      child: DropdownButtonFormField<int>(
+      child: PickerField<int?>(
         // The field keeps its own copy of the value, so one set from code —
         // the first load, or an entry just defined — needs a fresh field.
         key: ValueKey('${picker.field}:${picker.id}'),
-        initialValue: picker.id,
-        isDense: true,
-        decoration: InputDecoration(
-          labelText: picker.field,
-          isDense: true,
-          helperText: picker.loading ? 'Loading…' : null,
-        ),
-        items: [
-          if (picker.optional)
-            const DropdownMenuItem(value: null, child: Text('—')),
-          for (final row in picker.rows)
-            DropdownMenuItem(value: row['id'] as int, child: Text('${row['name']}')),
-          const DropdownMenuItem(value: _newTerm, child: Text('New…')),
-        ],
-        onChanged: picker.loading
-            ? null
-            : (picked) {
-                if (picked == _newTerm) {
-                  _addTerm(picker);
-                } else {
-                  setState(() => picker.id = picked);
-                }
-              },
+        label: picker.field,
+        value: picker.id,
+        helperText: picker.loading ? 'Loading…' : null,
+        enabled: !picker.loading,
+        entries: _termEntries(picker, picker.rows),
+        search: (query) async =>
+            _termEntries(picker, await ApiScope.of(context).list(picker.path, {'search': query})),
+        onSelected: (picked) {
+          if (picked == _newTerm) {
+            _addTerm(picker);
+          } else {
+            setState(() => picker.id = picked);
+          }
+        },
       ),
     );
   }

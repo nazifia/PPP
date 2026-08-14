@@ -1293,7 +1293,12 @@ class StockMovementViewSet(PrintListMixin, viewsets.ReadOnlyModelViewSet):
     serializer_class = StockMovementSerializer
     permission_classes = [IsAuthenticated]
     filter_backends = [filters.SearchFilter]
-    search_fields = ['product__generic_name', 'product__brand', 'kind', 'note']
+    # Strength among them because the balances picker labels a row with
+    # `str(product)` — 'Paracetamol 500mg' — and a search that cannot match
+    # what the label shows reads as a broken box.
+    search_fields = [
+        'product__generic_name', 'product__brand', 'product__strength', 'kind', 'note',
+    ]
 
     def get_queryset(self):
         user = self.request.user
