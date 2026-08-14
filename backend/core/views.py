@@ -40,6 +40,7 @@ from rest_framework.views import APIView
 from . import services
 from .models import (
     DEFAULT_REORDER_LEVEL,
+    TRANSFER_OPEN_STATUSES,
     AuditLog,
     CreditNote,
     Delivery,
@@ -59,6 +60,8 @@ from .models import (
     RequisitionLine,
     Role,
     StockMovement,
+    Transfer,
+    TransferStatus,
     Unit,
     User,
     audit,
@@ -94,6 +97,12 @@ from .serializers import (
     RequisitionListSerializer,
     RequisitionSerializer,
     StockMovementSerializer,
+    TransferApproveSerializer,
+    TransferDecisionSerializer,
+    TransferIssueSerializer,
+    TransferReceiveSerializer,
+    TransferRequestSerializer,
+    TransferSerializer,
     UnitSerializer,
     UserCreateSerializer,
     UserSerializer,
@@ -257,9 +266,11 @@ class MeView(APIView):
         # call, and /users/ refuses to close the last one an organisation has.
         # Left open here, that check is walked round by the last administrator
         # closing their own account and locking the tenant out of itself.
+        # The unit is the same kind of grant: it says whose stock this person
+        # may hand out, so moving yourself to another one is not yours to do.
         data = {
             key: value for key, value in request.data.items()
-            if key not in ('role', 'is_active')
+            if key not in ('role', 'is_active', 'unit')
         }
         serializer = UserSerializer(request.user, data=data, partial=True)
         serializer.is_valid(raise_exception=True)
@@ -542,6 +553,34 @@ class DepartmentViewSet(viewsets.ModelViewSet):
         require_org(self.request.user)
         serializer.save(organization=self.request.user.scope_org)
 
+    def perform_destroy(self, instance):
+        # A department stands for its units, so deleting one would take their
+        # shelves with it — see `check_unit_is_empty`.
+        for unit in instance.units.all():
+            check_unit_is_empty(unit)
+        instance.delete()
+
+
+def check_unit_is_empty(unit):
+    """Refuse to delete a unit that is still holding something.
+
+    Units own stock now: the ledger rows are tagged with them, and deleting one
+    sets that tag to NULL — which silently moves everything it was holding into
+    the organisation's own store, with no record that it ever moved. An open
+    transfer goes the same way, into a request neither side can finish. Retiring
+    the unit is what stops new work being filed under it; this only stops the
+    row being destroyed while it still means something.
+    """
+    held = StockMovement.objects.filter(unit=unit).exists()
+    open_transfers = Transfer.objects.filter(
+        Q(from_unit=unit) | Q(to_unit=unit), status__in=TRANSFER_OPEN_STATUSES,
+    ).exists()
+    if held or open_transfers:
+        raise ValidationError(
+            f'{unit} still has stock movements or open transfers against it. '
+            f'Retire it instead, which stops new work being filed under it.'
+        )
+
 
 class UnitViewSet(viewsets.ModelViewSet):
     """Units of the caller's departments. `?department=<id>` narrows to one."""
@@ -579,6 +618,11 @@ class UnitViewSet(viewsets.ModelViewSet):
         require_org(self.request.user)
         self._check_department(serializer)
         serializer.save()
+
+    def perform_destroy(self, instance):
+        services.require_owner(self.request.user, instance.department.organization)
+        check_unit_is_empty(instance)
+        instance.delete()
 
 
 class CatalogueTermViewSet(viewsets.ModelViewSet):
@@ -1304,11 +1348,20 @@ class StockMovementViewSet(PrintListMixin, viewsets.ReadOnlyModelViewSet):
         user = self.request.user
         queryset = StockMovement.objects.filter(
             **org_scope(user, organization=user.scope_org),
-        ).select_related('product', 'organization', 'delivery')
+        ).select_related('product', 'organization', 'delivery', 'unit__department')
         params = self.request.query_params
+        # `?unit=store` is how the organisation's own shelf is asked for: it
+        # holds every row written before units could hold stock, and everything
+        # received against a request that named no unit.
+        unit = params.get('unit')
+        if unit == 'store':
+            queryset = queryset.filter(unit__isnull=True)
+        elif unit:
+            queryset = queryset.filter(unit_id=unit)
         for param, clause in (
             ('product', 'product_id'),
             ('kind', 'kind'),
+            ('department', 'unit__department_id'),
             # Inclusive on both ends, because a user picking 1-31 March means March.
             ('from', 'created_at__date__gte'),
             ('to', 'created_at__date__lte'),
@@ -1367,7 +1420,9 @@ class StockMovementViewSet(PrintListMixin, viewsets.ReadOnlyModelViewSet):
         """What the ledger adds up to per item, under the same filters as the list.
 
         The only record of what a hospital holds: it owns no catalogue row, so
-        there is no `stock_qty` to read on its side.
+        there is no `stock_qty` to read on its side. `?unit=` narrows it to one
+        unit's shelf, which is what the screen raising a transfer reads to see
+        whether the unit next door has any to spare.
         """
         totals = (
             self.filter_queryset(self.get_queryset())
@@ -1385,6 +1440,143 @@ class StockMovementViewSet(PrintListMixin, viewsets.ReadOnlyModelViewSet):
         ]
         rows.sort(key=lambda row: row['product_name'])
         return Response(rows)
+
+
+class TransferViewSet(
+    PrintMixin, mixins.ListModelMixin, mixins.RetrieveModelMixin, viewsets.GenericViewSet,
+):
+    """Stock moving between two units of one department, inside one hospital.
+
+    `?unit=` answers with both sides of that unit's trade, `?direction=in|out`
+    picks one of them, and `?status=` narrows to what is still open.
+    """
+
+    print_kind = 'transfer'
+    serializer_class = TransferSerializer
+    permission_classes = [IsAuthenticated, IsHospital]
+    filter_backends = [filters.SearchFilter, filters.OrderingFilter]
+    search_fields = [
+        'reference', 'note', 'from_unit__name', 'to_unit__name',
+        'from_unit__department__name',
+    ]
+    ordering_fields = ['created_at', 'decided_at', 'status']
+
+    def get_queryset(self):
+        user = self.request.user
+        queryset = Transfer.objects.filter(
+            **org_scope(user, hospital=user.scope_org),
+        ).select_related(
+            'from_unit__department', 'to_unit__department', 'requested_by', 'decided_by',
+        )
+        params = self.request.query_params
+        status_param = params.get('status')
+        if status_param:
+            queryset = queryset.filter(status__in=status_param.split(','))
+        department = params.get('department')
+        if department:
+            # Both units share it, so either side answers the same question.
+            queryset = queryset.filter(from_unit__department_id=department)
+        unit = params.get('unit')
+        if unit:
+            direction = params.get('direction')
+            if direction == 'in':
+                queryset = queryset.filter(to_unit_id=unit)
+            elif direction == 'out':
+                queryset = queryset.filter(from_unit_id=unit)
+            else:
+                queryset = queryset.filter(Q(from_unit_id=unit) | Q(to_unit_id=unit))
+        # item_count walks the lines, so an index page of 25 asks 25 questions
+        # without this, and the detail screen prints them. Only the reads
+        # prefetch: `issue` writes the issued quantities onto these same lines
+        # and then serialises the transfer, and a cache filled in beforehand
+        # would answer with what the lines said before anything was handed over.
+        if self.action in ('list', 'retrieve', 'pending'):
+            return queryset.prefetch_related('lines__product__unit')
+        return queryset
+
+    def create(self, request, *args, **kwargs):
+        """One unit asks another for stock. Nothing moves until it is issued."""
+        require_org(request.user)
+        serializer = TransferRequestSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        transfer = services.request_transfer(
+            request.user,
+            serializer.validated_data['from_unit'],
+            serializer.validated_data['to_unit'],
+            serializer.validated_data['items'],
+            serializer.validated_data.get('note', ''),
+        )
+        return Response(
+            TransferSerializer(self.get_queryset().get(pk=transfer.pk)).data,
+            status=status.HTTP_201_CREATED,
+        )
+
+    @action(detail=True, methods=['post'])
+    def approve(self, request, pk=None):
+        """The holding unit agrees to a quantity. Nothing moves until it is issued."""
+        serializer = TransferApproveSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        transfer = services.approve_transfer(
+            self.get_object(), request.user,
+            serializer.validated_data['items'],
+            serializer.validated_data.get('note', ''),
+        )
+        return Response(TransferSerializer(transfer).data)
+
+    @action(detail=True, methods=['post'])
+    def issue(self, request, pk=None):
+        """The holding unit hands over what it can spare. This is what moves stock."""
+        serializer = TransferIssueSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        transfer = services.issue_transfer(
+            self.get_object(), request.user,
+            serializer.validated_data['items'],
+            serializer.validated_data.get('note', ''),
+        )
+        return Response(TransferSerializer(transfer).data)
+
+    @action(detail=True, methods=['post'])
+    def receive(self, request, pk=None):
+        """The asking unit confirms what turned up. Silence means all of it."""
+        serializer = TransferReceiveSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        transfer = services.receive_transfer(
+            self.get_object(), request.user,
+            serializer.validated_data.get('items') or [],
+            serializer.validated_data.get('note', ''),
+        )
+        return Response(TransferSerializer(transfer).data)
+
+    @action(detail=True, methods=['post'])
+    def reject(self, request, pk=None):
+        """The holding unit refuses. Nothing moves."""
+        serializer = TransferDecisionSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        transfer = services.reject_transfer(
+            self.get_object(), request.user, serializer.validated_data['reason'],
+        )
+        return Response(TransferSerializer(transfer).data)
+
+    @action(detail=True, methods=['post'])
+    def cancel(self, request, pk=None):
+        """The asking unit withdraws it before anyone answers."""
+        transfer = services.cancel_transfer(
+            self.get_object(), request.user, request.data.get('reason', ''),
+        )
+        return Response(TransferSerializer(transfer).data)
+
+    @action(detail=False)
+    def pending(self, request):
+        """Everything still waiting on somebody: agreement, goods or a signature."""
+        rows = self.filter_queryset(self.get_queryset()).filter(
+            status__in=[*TRANSFER_OPEN_STATUSES, TransferStatus.ISSUED],
+        )
+        page = self.paginate_queryset(rows)
+        serializer = TransferSerializer(page if page is not None else rows, many=True)
+        return (
+            self.get_paginated_response(serializer.data) if page is not None
+            else Response(serializer.data)
+        )
 
 
 class AuditLogViewSet(PrintListMixin, viewsets.ReadOnlyModelViewSet):
@@ -1488,6 +1680,13 @@ def dashboard(request):
         'partners': Partnership.objects.filter(
             **org_scope(user, **{('supplier' if is_supplier else 'hospital'): org}),
             is_active=True,
+        ).count(),
+        # Transfers between a hospital's own units, waiting on somebody: agreed
+        # to and not handed over, handed over and not signed for, or not yet
+        # answered at all. A supplier has no units, so it has none of these.
+        'transfers_pending': 0 if is_supplier else Transfer.objects.filter(
+            **org_scope(user, hospital=org),
+            status__in=[*TRANSFER_OPEN_STATUSES, TransferStatus.ISSUED],
         ).count(),
         'catalogue_items': catalogue.count() if is_supplier or user.sees_all_tenants else None,
         # Against each item's own reorder level, and against what is *available*

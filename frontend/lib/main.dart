@@ -298,7 +298,9 @@ class _HomeShellState extends State<HomeShell> {
         // consignments at the door to check in.
         if (api.isSupplier) 2: at('awaiting_action') else 3: at('deliveries_in_transit'),
         // Money lives behind More: payments to confirm, and debts running late.
-        4: at('payments_pending') + at('invoices_overdue'),
+        // So do transfers between units, which wait on somebody until they are
+        // agreed, handed over and signed for.
+        4: at('payments_pending') + at('invoices_overdue') + at('transfers_pending'),
       };
       if (mounted) {
         setState(() => _waiting = {

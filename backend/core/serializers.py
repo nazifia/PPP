@@ -32,6 +32,8 @@ from .models import (
     RequisitionLine,
     Role,
     StockMovement,
+    Transfer,
+    TransferLine,
     Unit,
     User,
     audit,
@@ -96,23 +98,46 @@ class OrganizationSerializer(serializers.ModelSerializer):
         return unique_org_phone(value, self.instance)
 
 
+def own_unit(user, unit):
+    """A unit of the account holder's own organisation, and one still open.
+
+    An account's unit says whose shelf that person may empty, so it is checked
+    the same way the units on a request are: it has to be this organisation's,
+    and it has to be a unit anybody is still working in.
+    """
+    if unit is None:
+        return None
+    if unit.department.organization_id != user.scope_org_id:
+        raise serializers.ValidationError('That unit belongs to another organisation.')
+    if not unit.is_active or not unit.department.is_active:
+        raise serializers.ValidationError(f'{unit} has been retired.')
+    return unit
+
+
 class UserSerializer(serializers.ModelSerializer):
     # scope_org rather than organization, so a superuser acting inside a tenant
     # is reported as that tenant. For everyone else the two are the same.
     organization = serializers.PrimaryKeyRelatedField(source='scope_org', read_only=True)
     organization_name = serializers.CharField(source='scope_org.name', read_only=True)
     organization_kind = serializers.CharField(source='scope_org.kind', read_only=True)
+    unit_name = serializers.SerializerMethodField()
 
     class Meta:
         model = User
         fields = [
-            'id', 'phone', 'full_name', 'email', 'role', 'job_title',
+            'id', 'phone', 'full_name', 'email', 'role', 'job_title', 'unit', 'unit_name',
             'organization', 'organization_name', 'organization_kind',
             'is_superuser', 'must_change_password', 'is_active', 'date_joined',
         ]
         read_only_fields = [
             'organization', 'is_superuser', 'must_change_password', 'date_joined',
         ]
+
+    def get_unit_name(self, user):
+        return str(user.unit) if user.unit_id else ''
+
+    def validate_unit(self, value):
+        return own_unit(self.context['request'].user, value)
 
     def validate_phone(self, value):
         # The model normalises on the way into the database, so the clash has to
@@ -132,13 +157,16 @@ class UserCreateSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = User
-        fields = ['id', 'phone', 'full_name', 'email', 'role', 'job_title', 'password']
+        fields = ['id', 'phone', 'full_name', 'email', 'role', 'job_title', 'unit', 'password']
 
     def validate_phone(self, value):
         phone = normalize_phone(value)
         if User.objects.filter(phone=phone).exists():
             raise serializers.ValidationError('That phone number is already registered.')
         return phone
+
+    def validate_unit(self, value):
+        return own_unit(self.context['request'].user, value)
 
     def create(self, validated):
         password = validated.pop('password')
@@ -776,6 +804,10 @@ class DispenseSerializer(serializers.Serializer):
     product = serializers.PrimaryKeyRelatedField(queryset=Product.objects.all())
     qty = QuantityField(min_value=HALF_UNIT)
     note = serializers.CharField(max_length=255, required=False, allow_blank=True, default='')
+    # Which shelf it came off. Left out, it comes off the organisation's own store.
+    unit = serializers.PrimaryKeyRelatedField(
+        queryset=Unit.objects.all(), required=False, allow_null=True,
+    )
 
 
 class AdjustSerializer(serializers.Serializer):
@@ -785,6 +817,9 @@ class AdjustSerializer(serializers.Serializer):
     # No minimum: writing stock off is the whole point, and that is a negative.
     qty = QuantityField()
     reason = serializers.CharField(max_length=255)
+    unit = serializers.PrimaryKeyRelatedField(
+        queryset=Unit.objects.all(), required=False, allow_null=True,
+    )
 
 
 class StockMovementSerializer(serializers.ModelSerializer):
@@ -792,15 +827,112 @@ class StockMovementSerializer(serializers.ModelSerializer):
     delivery_reference = serializers.CharField(source='delivery.reference', read_only=True)
     # Only ever differs between rows for a superuser, who reads every tenant.
     organization_name = serializers.CharField(source='organization.name', read_only=True)
+    unit_name = serializers.SerializerMethodField()
     qty = QuantityField(read_only=True)
 
     class Meta:
         model = StockMovement
         fields = [
-            'id', 'product', 'product_name', 'organization_name', 'kind', 'qty',
-            'delivery', 'delivery_reference', 'batch_no', 'expiry_date', 'note',
-            'created_at',
+            'id', 'product', 'product_name', 'organization_name', 'unit', 'unit_name',
+            'kind', 'qty', 'delivery', 'delivery_reference', 'batch_no', 'expiry_date',
+            'note', 'created_at',
         ]
+
+    def get_unit_name(self, movement):
+        """Empty for the organisation's own store, which belongs to no unit."""
+        return str(movement.unit) if movement.unit_id else ''
+
+
+class TransferLineSerializer(serializers.ModelSerializer):
+    product_name = serializers.CharField(source='product.__str__', read_only=True)
+    unit = serializers.CharField(source='product.unit.name', read_only=True)
+    qty_requested = QuantityField(min_value=HALF_UNIT)
+    qty_approved = QuantityField(read_only=True)
+    qty_issued = QuantityField(read_only=True)
+    qty_received = QuantityField(read_only=True)
+
+    class Meta:
+        model = TransferLine
+        fields = [
+            'id', 'product', 'product_name', 'unit', 'qty_requested', 'qty_approved',
+            'qty_issued', 'qty_received', 'shortfall_reason',
+        ]
+        read_only_fields = ['shortfall_reason']
+
+
+class TransferSerializer(serializers.ModelSerializer):
+    lines = TransferLineSerializer(many=True, read_only=True)
+    from_unit_name = serializers.CharField(source='from_unit.name', read_only=True)
+    to_unit_name = serializers.CharField(source='to_unit.name', read_only=True)
+    department_name = serializers.CharField(read_only=True)
+    requested_by_name = serializers.CharField(source='requested_by.full_name', read_only=True)
+    decided_by_name = serializers.CharField(source='decided_by.full_name', read_only=True)
+    issued_by_name = serializers.CharField(source='issued_by.full_name', read_only=True)
+    received_by_name = serializers.CharField(source='received_by.full_name', read_only=True)
+    item_count = serializers.IntegerField(source='lines.count', read_only=True)
+
+    class Meta:
+        model = Transfer
+        fields = [
+            'id', 'reference', 'hospital', 'from_unit', 'from_unit_name', 'to_unit',
+            'to_unit_name', 'department_name', 'status', 'note', 'requested_by',
+            'requested_by_name', 'created_at', 'decided_by', 'decided_by_name',
+            'decided_at', 'decision_note', 'issued_by', 'issued_by_name', 'issued_at',
+            'issue_note', 'received_by', 'received_by_name', 'received_at',
+            'receipt_note', 'item_count', 'lines',
+        ]
+        read_only_fields = fields
+
+
+class TransferItemSerializer(serializers.Serializer):
+    product = serializers.PrimaryKeyRelatedField(queryset=Product.objects.all())
+    qty = QuantityField(min_value=HALF_UNIT)
+
+
+class TransferRequestSerializer(serializers.Serializer):
+    """One unit asking another in its own department for stock it holds."""
+
+    from_unit = serializers.PrimaryKeyRelatedField(queryset=Unit.objects.all())
+    to_unit = serializers.PrimaryKeyRelatedField(queryset=Unit.objects.all())
+    items = TransferItemSerializer(many=True)
+    note = serializers.CharField(required=False, allow_blank=True, default='')
+
+
+class TransferApprovalItemSerializer(serializers.Serializer):
+    line = serializers.IntegerField()
+    qty_approved = QuantityField(min_value=Decimal('0'))
+
+
+class TransferApproveSerializer(serializers.Serializer):
+    items = TransferApprovalItemSerializer(many=True)
+    note = serializers.CharField(max_length=255, required=False, allow_blank=True, default='')
+
+
+class TransferIssueItemSerializer(serializers.Serializer):
+    line = serializers.IntegerField()
+    qty = QuantityField(min_value=Decimal('0'))
+
+
+class TransferIssueSerializer(serializers.Serializer):
+    items = TransferIssueItemSerializer(many=True)
+    note = serializers.CharField(max_length=255, required=False, allow_blank=True, default='')
+
+
+class TransferReceiptItemSerializer(serializers.Serializer):
+    line = serializers.IntegerField()
+    # Left out, the line is taken as having arrived exactly as it was issued,
+    # which is what happens nearly every time.
+    qty_received = QuantityField(min_value=Decimal('0'), required=False, allow_null=True)
+    reason = serializers.CharField(max_length=255, required=False, allow_blank=True)
+
+
+class TransferReceiveSerializer(serializers.Serializer):
+    items = TransferReceiptItemSerializer(many=True, required=False, default=list)
+    note = serializers.CharField(max_length=255, required=False, allow_blank=True, default='')
+
+
+class TransferDecisionSerializer(serializers.Serializer):
+    reason = serializers.CharField(max_length=255)
 
 
 class AuditLogSerializer(serializers.ModelSerializer):

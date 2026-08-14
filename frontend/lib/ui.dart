@@ -73,6 +73,10 @@ const statusColors = <String, Color>{
   'PAID': Colors.green,
   'PENDING': Colors.orange,
   'CONFIRMED': Colors.green,
+  // A transfer between units: asked for, agreed to, handed over, signed for.
+  'REQUESTED': Colors.orange,
+  'ISSUED': Colors.indigo,
+  'RECEIVED': Colors.green,
   'WITHDRAWN': Colors.brown,
   'PARTIAL': Colors.teal,
   'AVL': Colors.green,

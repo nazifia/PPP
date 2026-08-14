@@ -41,6 +41,9 @@ from .models import (
     PaymentStatus,
     Product,
     Requisition,
+    Transfer,
+    TransferStatus,
+    Unit,
     User,
 )
 
@@ -292,6 +295,82 @@ def payment_document(obj):
     }
 
 
+def unit_party(unit, hospital):
+    """A unit as a party on paper: its own name over its department's.
+
+    Not [party], which describes an organisation — both sides of a transfer are
+    inside one, and what tells them apart is which unit and which department.
+    """
+    return {
+        'name': str(unit.name) if unit else DASH,
+        'address': f'{unit.department.name}, {hospital.name}' if unit else hospital.name,
+        'phone': hospital.phone,
+        'email': hospital.email,
+    }
+
+
+def transfer_document(obj):
+    """The note that travels with the cartons, and is signed at both ends.
+
+    No money on it: nothing was bought, and the two sides are units of one
+    hospital. What it has instead is the four quantities — asked, agreed, given,
+    received — because the shortfall between the last two is the whole reason
+    anybody keeps the paper.
+    """
+    lines = obj.lines.select_related('product__unit').all()
+    issued = obj.status in (TransferStatus.ISSUED, TransferStatus.RECEIVED)
+    received = obj.status == TransferStatus.RECEIVED
+    return {
+        'title': 'STOCK TRANSFER NOTE',
+        'reference': obj.reference,
+        'banner': '' if issued else
+                  'NOTHING HAS MOVED YET — this is the request, not a hand-over.',
+        'from_label': 'Issued by',
+        'party_from': unit_party(obj.from_unit, obj.hospital),
+        'to_label': 'Received by',
+        'party_to': unit_party(obj.to_unit, obj.hospital),
+        'meta': [
+            ('Status', obj.get_status_display()),
+            ('Department', obj.department_name or DASH),
+            ('Asked by', who(obj.requested_by)),
+            ('Asked on', when(obj.created_at)),
+            ('Agreed by', who(obj.decided_by)),
+            ('Agreed on', when(obj.decided_at)),
+            ('Handed over by', who(obj.issued_by)),
+            ('Handed over on', when(obj.issued_at)),
+            ('Signed for by', who(obj.received_by)),
+            ('Signed for on', when(obj.received_at)),
+        ],
+        'columns': [
+            ('#', 'right'), ('Item', 'left'), ('Unit', 'left'), ('Asked', 'right'),
+            ('Agreed', 'right'), ('Given', 'right'), ('Received', 'right'),
+            ('Short because', 'left'),
+        ],
+        'rows': [
+            [
+                str(number), str(line.product), line.product.unit.name,
+                qty(line.qty_requested), qty(line.qty_approved),
+                qty(line.qty_issued) if issued else DASH,
+                qty(line.qty_received) if received else DASH,
+                line.shortfall_reason or '',
+            ]
+            for number, line in enumerate(lines, start=1)
+        ],
+        'totals': [
+            ('Items', str(len(lines))),
+            *([('Quantity handed over', qty(sum(line.qty_issued for line in lines)))]
+              if issued else []),
+        ],
+        'notes': [
+            ('Note', obj.note),
+            ('Said on deciding', obj.decision_note),
+            ('Said on issue', obj.issue_note),
+            ('Said on receipt', obj.receipt_note),
+        ],
+        'signatures': ['Issued by', 'Received by'],
+    }
+
+
 # ---------------------------------------------------------------------------
 # Ledgers, which are a filtered list rather than one row
 # ---------------------------------------------------------------------------
@@ -342,28 +421,40 @@ def ledger_context(user, title, filters, labels, columns, rows, count):
 
 
 STOCK_LEDGER_FILTERS = [
-    ('product', 'Item'), ('kind', 'Movement'), ('from', 'From'), ('to', 'To'),
-    ('search', 'Search'),
+    ('product', 'Item'), ('kind', 'Movement'), ('unit', 'Shelf'), ('from', 'From'),
+    ('to', 'To'), ('search', 'Search'),
 ]
+
+#: What the ledger calls the organisation's own store, which belongs to no unit.
+STORE = 'Organisation store'
 
 
 def stock_ledger_document(user, filters):
     found = scoped_rows('StockMovementViewSet', user, filters)
     rows = list(found[:MAX_LIST_ROWS])
-    # The screen filters by id; the sheet has to say which item that was.
-    shown = dict(filters)
+    # The screen filters by id; the sheet has to say which item and which shelf
+    # those were, or it reads as a ledger of everything.
+    # `.items()` rather than `dict(filters)`: the filters arrive as a QueryDict
+    # from `print/` and as a plain dict from a signed link, and only this reads
+    # one value per key out of both.
+    shown = dict(filters.items())
     if shown.get('product'):
         product = Product.objects.filter(pk=shown['product']).first()
         shown['product'] = str(product) if product else shown['product']
+    if shown.get('unit'):
+        unit = Unit.objects.filter(pk=shown['unit']).first() if shown['unit'] != 'store' else None
+        shown['unit'] = str(unit) if unit else STORE
     return ledger_context(
         user, 'STOCK LEDGER', shown, STOCK_LEDGER_FILTERS,
         columns=[
-            ('When', 'left'), ('Item', 'left'), ('Movement', 'left'),
+            ('When', 'left'), ('Item', 'left'), ('Shelf', 'left'), ('Movement', 'left'),
             ('Quantity', 'right'), ('Delivery', 'left'), ('Note', 'left'),
         ],
         rows=[
             [
-                when(row.created_at), str(row.product), row.get_kind_display(),
+                when(row.created_at), str(row.product),
+                str(row.unit) if row.unit_id else STORE,
+                row.get_kind_display(),
                 qty(row.qty), row.delivery.reference if row.delivery else DASH,
                 row.note or '',
             ]
@@ -405,6 +496,7 @@ DOCUMENTS = {
     'delivery': (Delivery, delivery_document),
     'invoice': (Invoice, invoice_document),
     'payment': (Payment, payment_document),
+    'transfer': (Transfer, transfer_document),
 }
 
 LEDGERS = {

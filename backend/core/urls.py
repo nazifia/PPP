@@ -20,6 +20,7 @@ router.register('invoices', views.InvoiceViewSet, basename='invoice')
 router.register('payments', views.PaymentViewSet, basename='payment')
 router.register('credits', views.CreditNoteViewSet, basename='credit')
 router.register('stock-movements', views.StockMovementViewSet, basename='stock-movement')
+router.register('transfers', views.TransferViewSet, basename='transfer')
 router.register('audit-logs', views.AuditLogViewSet, basename='audit-log')
 
 urlpatterns = [

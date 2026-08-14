@@ -14,6 +14,7 @@ from rest_framework.exceptions import PermissionDenied, ValidationError
 
 from .models import (
     PAYMENT_DEAD_STATUSES,
+    TRANSFER_OPEN_STATUSES,
     CreditNote,
     CreditNoteLine,
     CreditStatus,
@@ -31,6 +32,9 @@ from .models import (
     Product,
     ReqStatus,
     StockMovement,
+    Transfer,
+    TransferLine,
+    TransferStatus,
     audit,
 )
 
@@ -67,42 +71,74 @@ def require_owner(user, org, message='This row belongs to another organisation.'
         raise PermissionDenied(message)
 
 
-def stock_balance(organization, product):
+def stock_balance(organization, product, unit=None, store=False):
     """What the ledger says an organisation still holds of one item.
 
     A hospital owns no catalogue row, so its movements are the only record.
+    Name a `unit` and the answer narrows to that unit's shelf, which is what a
+    transfer between two of them is checked against. `store` narrows it the
+    other way, to the organisation's own store — everything held by no unit at
+    all, which is where a hospital that keeps no units holds all of it.
+
+    Neither is the same as the plain total, and taking one for the other is how
+    a central dispense comes to eat stock a ward is standing next to.
     """
-    total = StockMovement.objects.filter(
-        organization=organization, product=product,
-    ).aggregate(total=Sum('qty'))['total']
-    return total or ZERO
+    rows = StockMovement.objects.filter(organization=organization, product=product)
+    if unit is not None:
+        rows = rows.filter(unit=unit)
+    elif store:
+        rows = rows.filter(unit__isnull=True)
+    return rows.aggregate(total=Sum('qty'))['total'] or ZERO
+
+
+def require_own_unit(user, unit):
+    """A unit of the caller's own hospital, still open for business."""
+    if unit.department.organization_id != user.scope_org_id:
+        raise ValidationError('That unit belongs to another organisation.')
+    # A department stands for its units, as it does everywhere else, so retiring
+    # one closes what sits under it too.
+    if not unit.is_active or not unit.department.is_active:
+        raise ValidationError(f'{unit} has been retired.')
 
 
 @transaction.atomic
-def dispense(user, product, qty, note=''):
-    """A hospital records what it handed out. No approval: the ward already used it."""
+def dispense(user, product, qty, note='', unit=None):
+    """A hospital records what it handed out. No approval: the ward already used it.
+
+    A unit may name itself, and then the goods come off that unit's shelf rather
+    than off the organisation's own store.
+    """
     require_hospital(user)
     if qty <= 0:
         raise ValidationError('Dispensed quantity must be greater than zero.')
+    if unit is not None:
+        require_own_unit(user, unit)
     # The catalogue row is the lock, as it is for a supplier dispatch, so two
     # dispenses cannot both read the same balance and overdraw it.
     # ponytail: that serialises every hospital holding the item; lock per
     # organisation if contention ever shows up.
     Product.objects.select_for_update().get(pk=product.pk)
-    held = stock_balance(user.scope_org, product)
+    # Naming no unit means the organisation's own store, not the sum of every
+    # shelf in the building: what a ward is holding is not there to be handed
+    # out at the central counter.
+    held = stock_balance(user.scope_org, product, unit=unit, store=True)
     if qty > held:
-        raise ValidationError(f'{product}: only {held} in stock.')
+        where = f' on {unit}' if unit is not None else ' in the store'
+        raise ValidationError(f'{product}: only {held} in stock{where}.')
 
     movement = StockMovement.objects.create(
-        organization=user.scope_org, product=product,
+        organization=user.scope_org, product=product, unit=unit,
         kind=StockMovement.DISPENSE, qty=-qty, note=note,
     )
-    audit(user, 'StockMovement', movement.pk, 'DISPENSED', product=str(product), qty=qty)
+    audit(
+        user, 'StockMovement', movement.pk, 'DISPENSED',
+        product=str(product), qty=qty, unit=str(unit) if unit else None,
+    )
     return movement
 
 
 @transaction.atomic
-def adjust(user, product, qty, reason):
+def adjust(user, product, qty, reason, unit=None):
     """A hospital corrects its own ledger. Signed: negative writes stock off.
 
     Dispensing is the only other way goods leave a hospital, and it means a ward
@@ -118,6 +154,8 @@ def adjust(user, product, qty, reason):
         raise ValidationError('An adjustment of zero changes nothing.')
     if not (reason or '').strip():
         raise ValidationError('Say why the ledger is being adjusted.')
+    if unit is not None:
+        require_own_unit(user, unit)
 
     # Same lock as a dispense, for the same reason: two adjustments must not
     # both read the balance before either has written.
@@ -131,17 +169,22 @@ def adjust(user, product, qty, reason):
         organization=user.scope_org, product=product,
     ).exists():
         raise ValidationError(f'{product} has never been received here.')
-    held = stock_balance(user.scope_org, product)
+    # The shelf being corrected, as for a dispense: one unit's, or the store.
+    held = stock_balance(user.scope_org, product, unit=unit, store=True)
     if held + qty < 0:
-        raise ValidationError(f'{product}: only {held} in stock, so {qty} would go below zero.')
+        where = f' on {unit}' if unit is not None else ' in the store'
+        raise ValidationError(
+            f'{product}: only {held} in stock{where}, so {qty} would go below zero.'
+        )
 
     movement = StockMovement.objects.create(
-        organization=user.scope_org, product=product,
+        organization=user.scope_org, product=product, unit=unit,
         kind=StockMovement.ADJUST, qty=qty, note=reason.strip(),
     )
     audit(
         user, 'StockMovement', movement.pk, 'ADJUSTED',
         product=str(product), qty=qty, reason=reason.strip(),
+        unit=str(unit) if unit else None,
     )
     return movement
 
@@ -388,6 +431,11 @@ def verify(delivery, user, results, remark=''):
         if accepted:
             StockMovement.objects.create(
                 organization=requisition.hospital, product=product,
+                # Goods land on the shelf of whichever unit asked for them, so a
+                # unit can later say what it holds and lend some of it to the
+                # unit next door. A request that named only a department — or
+                # nothing at all — lands in the organisation's own store.
+                unit_id=requisition.unit_id,
                 kind=StockMovement.RECEIPT, qty=accepted, delivery=delivery,
                 note=f'Receipt {delivery.reference}', **batch,
             )
@@ -516,6 +564,348 @@ def cancel(requisition, user, reason=''):
     requisition.save(update_fields=['status', 'note'])
     audit(user, 'Requisition', requisition.pk, 'CANCELLED', reason=reason)
     return requisition
+
+
+# ---------------------------------------------------------------------------
+# Transfers between units
+#
+# Two units of one department, in one hospital. Nothing is bought and no invoice
+# is raised: the goods are already the hospital's, and what moves is which shelf
+# they sit on. So the ledger writes the move as a pair — off the holding unit,
+# onto the asking one — and the hospital's own total does not change.
+#
+#   request ─▶ REQUESTED ─approve─▶ APPROVED ─issue─▶ ISSUED ─receive─▶ RECEIVED
+#                  ├──reject──▶ REJECTED    (the holding unit says no)
+#                  └──cancel──▶ CANCELLED   (the asking unit thought better)
+#
+# Agreeing and handing over are two acts by two people — a unit head says yes to
+# a quantity, whoever is at the shelf carries out what is actually there — and
+# the record keeps them apart. Each side answers for its own half: the holding
+# unit approves, refuses and issues; the asking unit requests, withdraws and
+# confirms what turned up.
+# ---------------------------------------------------------------------------
+
+
+def require_unit_member(user, unit, action):
+    """Only the unit's own people, or an administrator of the hospital.
+
+    An account that names no unit is one nobody has placed yet, and a transfer
+    is exactly the decision that needs placing: it says whose shelf is being
+    emptied. So it takes the unit's own staff, or the administrator who could
+    have set the unit in the first place.
+    """
+    if user.is_org_admin:
+        return
+    if unit is None or user.unit_id != unit.pk:
+        raise PermissionDenied(
+            f'Only {unit} or an administrator can {action}.' if unit
+            else f'Only an administrator can {action}.'
+        )
+
+
+def require_same_department(from_unit, to_unit):
+    if from_unit.pk == to_unit.pk:
+        raise ValidationError('A unit cannot request from itself.')
+    if from_unit.department_id != to_unit.department_id:
+        raise ValidationError(
+            'Both units must belong to the same department. Ask your department '
+            'head to raise it with the other department.'
+        )
+
+
+@transaction.atomic
+def request_transfer(user, from_unit, to_unit, items, note=''):
+    """One unit asks another in its department for stock.
+
+    `items` is [{'product': <Product>, 'qty': <decimal>}]. Nothing moves yet:
+    the holding unit has to agree to it, and then hand it over.
+    """
+    require_owner(
+        user, from_unit.department.organization,
+        'That unit belongs to another organisation.',
+    )
+    require_hospital(user)
+    require_own_unit(user, from_unit)
+    require_own_unit(user, to_unit)
+    require_same_department(from_unit, to_unit)
+    require_unit_member(user, to_unit, 'ask for stock on its behalf')
+    if not items:
+        raise ValidationError('Ask for at least one item.')
+
+    # The same item named twice is one line of more of it, as it is on a
+    # requisition, and a second row would land on the unique constraint.
+    wanted = defaultdict(lambda: ZERO)
+    for item in items:
+        qty = Decimal(item.get('qty') or 0)
+        if qty <= 0:
+            raise ValidationError('Requested quantity must be greater than zero.')
+        wanted[item['product']] += qty
+
+    transfer = Transfer.objects.create(
+        hospital=user.scope_org, from_unit=from_unit, to_unit=to_unit,
+        requested_by=user, note=note or '',
+    )
+    for product, qty in wanted.items():
+        TransferLine.objects.create(transfer=transfer, product=product, qty_requested=qty)
+
+    audit(
+        user, 'Transfer', transfer.pk, 'REQUESTED',
+        reference=transfer.reference, from_unit=str(from_unit), to_unit=str(to_unit),
+        lines=len(wanted),
+    )
+    return transfer
+
+
+def _transfer_lines(transfer, items, field):
+    """The transfer's lines, and the quantity named against each of them.
+
+    Shared by the three steps that answer line by line, which all read the same
+    payload — [{'line': <id>, '<field>': <decimal>}] — and all have to refuse an
+    id belonging to somebody else's transfer.
+    """
+    by_id = {item.get('line'): item for item in items}
+    lines = list(transfer.lines.select_related('product'))
+    unknown = set(by_id) - {line.id for line in lines}
+    if unknown:
+        raise ValidationError(f'Unknown line ids: {sorted(unknown)}')
+    return [(line, Decimal(by_id.get(line.id, {}).get(field) or 0)) for line in lines]
+
+
+@transaction.atomic
+def approve_transfer(transfer, user, items, note=''):
+    """The holding unit agrees to a quantity. Nothing moves yet.
+
+    `items` is [{'line': <id>, 'qty_approved': <decimal>}]. A line left out is
+    a line agreed at nothing, so a silence cannot be read as a promise — the
+    same rule a supplier's decision follows. Agreeing to everything and then
+    finding the shelf empty is what the issue step is for; nothing is held back
+    here, because a unit that has agreed to lend something still dispenses off
+    that shelf until the moment it hands it over.
+    """
+    require_owner(user, transfer.hospital, 'Not your transfer.')
+    require_hospital(user)
+    if transfer.status != TransferStatus.REQUESTED:
+        raise ValidationError('This transfer has already been decided.')
+    if transfer.from_unit is None or transfer.to_unit is None:
+        raise ValidationError('A unit on this transfer no longer exists.')
+    require_unit_member(user, transfer.from_unit, 'agree to give its stock away')
+
+    approved_total = ZERO
+    for line, qty in _transfer_lines(transfer, items, 'qty_approved'):
+        if qty < 0:
+            raise ValidationError('Approved quantity cannot be negative.')
+        if qty > line.qty_requested:
+            raise ValidationError(f'{line.product}: cannot agree to more than was asked for.')
+        line.qty_approved = qty
+        line.save(update_fields=['qty_approved'])
+        approved_total += qty
+
+    if approved_total == 0:
+        raise ValidationError('Nothing was agreed to. Refuse the request instead.')
+
+    transfer.status = TransferStatus.APPROVED
+    transfer.decided_by = user
+    transfer.decided_at = timezone.now()
+    transfer.decision_note = (note or '').strip()[:255]
+    transfer.save(update_fields=['status', 'decided_by', 'decided_at', 'decision_note'])
+    audit(
+        user, 'Transfer', transfer.pk, 'APPROVED',
+        reference=transfer.reference, qty=approved_total,
+        from_unit=str(transfer.from_unit), to_unit=str(transfer.to_unit),
+    )
+    return transfer
+
+
+@transaction.atomic
+def issue_transfer(transfer, user, items, note=''):
+    """The holding unit hands over part or all of what it agreed to.
+
+    `items` is [{'line': <id>, 'qty': <decimal>}]. Less than was agreed is the
+    ordinary case — the shelf is counted again when somebody is standing at it —
+    and what does not go is not owed: the asking unit raises another request if
+    it still wants it. This is the step that moves stock.
+    """
+    require_owner(user, transfer.hospital, 'Not your transfer.')
+    require_hospital(user)
+    if transfer.status != TransferStatus.APPROVED:
+        raise ValidationError(
+            'Only a transfer the holding unit has agreed to can be issued.'
+        )
+    if transfer.from_unit is None or transfer.to_unit is None:
+        raise ValidationError('A unit on this transfer no longer exists.')
+    require_unit_member(user, transfer.from_unit, 'hand its stock over')
+
+    issued_total = ZERO
+    for line, qty in _transfer_lines(transfer, items, 'qty'):
+        if qty < 0:
+            raise ValidationError('Issued quantity cannot be negative.')
+        if qty > line.qty_approved:
+            raise ValidationError(f'{line.product}: cannot issue more than was agreed.')
+        if qty == 0:
+            continue
+        # The same lock a dispense takes, and for the same reason: two people
+        # emptying one shelf must not both read it full.
+        Product.objects.select_for_update().get(pk=line.product_id)
+        held = stock_balance(transfer.hospital, line.product, unit=transfer.from_unit)
+        if qty > held:
+            raise ValidationError(f'{line.product}: {transfer.from_unit} holds only {held}.')
+
+        line.qty_issued = qty
+        line.save(update_fields=['qty_issued'])
+        # A pair, so the hospital's own total is untouched: the goods were always
+        # its own, and only the shelf they sit on has changed.
+        StockMovement.objects.create(
+            organization=transfer.hospital, product=line.product, unit=transfer.from_unit,
+            kind=StockMovement.TRANSFER, qty=-qty,
+            note=f'Transfer {transfer.reference} to {transfer.to_unit}'[:255],
+        )
+        StockMovement.objects.create(
+            organization=transfer.hospital, product=line.product, unit=transfer.to_unit,
+            kind=StockMovement.TRANSFER, qty=qty,
+            note=f'Transfer {transfer.reference} from {transfer.from_unit}'[:255],
+        )
+        issued_total += qty
+
+    if issued_total == 0:
+        raise ValidationError('Nothing was issued. Refuse the request instead.')
+
+    transfer.status = TransferStatus.ISSUED
+    transfer.issued_by = user
+    transfer.issued_at = timezone.now()
+    transfer.issue_note = (note or '').strip()[:255]
+    transfer.save(update_fields=['status', 'issued_by', 'issued_at', 'issue_note'])
+    audit(
+        user, 'Transfer', transfer.pk, 'ISSUED',
+        reference=transfer.reference, qty=issued_total,
+        from_unit=str(transfer.from_unit), to_unit=str(transfer.to_unit),
+    )
+    return transfer
+
+
+@transaction.atomic
+def receive_transfer(transfer, user, items, note=''):
+    """The asking unit says what actually turned up.
+
+    `items` is [{'line': <id>, 'qty_received': <decimal>, 'reason': str}], and a
+    line left out is taken as everything issued having arrived — the ordinary
+    case, and the one nobody should have to type.
+
+    The stock moved onto this unit's shelf when it was issued, so a short
+    delivery is not a transfer that did not happen: it is goods the hospital
+    thought it had and does not. The difference is written off the asking unit's
+    ledger here, with the reason on it, rather than left sitting there as stock
+    nobody can find.
+    """
+    require_owner(user, transfer.hospital, 'Not your transfer.')
+    require_hospital(user)
+    if transfer.status != TransferStatus.ISSUED:
+        raise ValidationError('Only stock that has been issued can be confirmed received.')
+    if transfer.to_unit is None:
+        # The shelf the goods landed on is gone, so a shortfall has nowhere to be
+        # written off. Correct the ledger with an adjustment instead.
+        raise ValidationError('The unit that asked for this no longer exists.')
+    require_unit_member(user, transfer.to_unit, 'confirm what it received')
+
+    received_total = ZERO
+    short_total = ZERO
+    by_id = {item.get('line'): item for item in items}
+    lines = list(transfer.lines.select_related('product'))
+    unknown = set(by_id) - {line.id for line in lines}
+    if unknown:
+        raise ValidationError(f'Unknown line ids: {sorted(unknown)}')
+
+    for line in lines:
+        result = by_id.get(line.id)
+        # Nothing said about a line is the line arriving as it was sent.
+        if result is None or result.get('qty_received') is None:
+            qty = line.qty_issued
+        else:
+            qty = Decimal(result.get('qty_received') or 0)
+        if qty < 0:
+            raise ValidationError('Received quantity cannot be negative.')
+        if qty > line.qty_issued:
+            raise ValidationError(
+                f'{line.product}: only {line.qty_issued} was issued, so {qty} cannot '
+                f'have arrived. Correct the ledger with an adjustment instead.'
+            )
+        short = line.qty_issued - qty
+        reason = ((result or {}).get('reason') or '').strip()
+        if short and not reason:
+            raise ValidationError(f'{line.product}: say what happened to the missing {short}.')
+
+        line.qty_received = qty
+        line.shortfall_reason = reason[:255]
+        line.save(update_fields=['qty_received', 'shortfall_reason'])
+        if short:
+            StockMovement.objects.create(
+                organization=transfer.hospital, product=line.product, unit=transfer.to_unit,
+                kind=StockMovement.ADJUST, qty=-short,
+                note=f'Transfer {transfer.reference} short: {line.shortfall_reason}'[:255],
+            )
+            short_total += short
+        received_total += qty
+
+    transfer.status = TransferStatus.RECEIVED
+    transfer.received_by = user
+    transfer.received_at = timezone.now()
+    transfer.receipt_note = (note or '').strip()[:255]
+    transfer.save(update_fields=['status', 'received_by', 'received_at', 'receipt_note'])
+    audit(
+        user, 'Transfer', transfer.pk, 'RECEIVED',
+        reference=transfer.reference, qty=received_total, short=short_total,
+        from_unit=str(transfer.from_unit), to_unit=str(transfer.to_unit),
+    )
+    return transfer
+
+
+@transaction.atomic
+def reject_transfer(transfer, user, reason=''):
+    """The holding unit says no. Nothing moves."""
+    require_owner(user, transfer.hospital, 'Not your transfer.')
+    require_hospital(user)
+    if transfer.status != TransferStatus.REQUESTED:
+        raise ValidationError('This transfer has already been decided.')
+    require_unit_member(user, transfer.from_unit, 'refuse a request for its stock')
+    if not (reason or '').strip():
+        raise ValidationError('Say why the request is being refused.')
+
+    transfer.status = TransferStatus.REJECTED
+    transfer.decided_by = user
+    transfer.decided_at = timezone.now()
+    transfer.decision_note = reason.strip()[:255]
+    transfer.save(update_fields=['status', 'decided_by', 'decided_at', 'decision_note'])
+    audit(
+        user, 'Transfer', transfer.pk, 'REJECTED',
+        reference=transfer.reference, reason=transfer.decision_note,
+    )
+    return transfer
+
+
+@transaction.atomic
+def cancel_transfer(transfer, user, reason=''):
+    """The asking unit withdraws the request before the goods leave the shelf.
+
+    An agreed transfer may still be withdrawn — nothing has moved, and a unit
+    that has found what it needed elsewhere should not have to take stock it no
+    longer wants. Once it is issued the goods are already on its shelf, and what
+    it does with them is a transfer back the other way.
+    """
+    require_owner(user, transfer.hospital, 'Not your transfer.')
+    require_hospital(user)
+    if transfer.status not in TRANSFER_OPEN_STATUSES:
+        raise ValidationError('A transfer can only be withdrawn before it is issued.')
+    require_unit_member(user, transfer.to_unit, 'withdraw its request')
+
+    transfer.status = TransferStatus.CANCELLED
+    transfer.decided_by = user
+    transfer.decided_at = timezone.now()
+    transfer.decision_note = (reason or '').strip()[:255]
+    transfer.save(update_fields=['status', 'decided_by', 'decided_at', 'decision_note'])
+    audit(
+        user, 'Transfer', transfer.pk, 'CANCELLED',
+        reference=transfer.reference, reason=transfer.decision_note,
+    )
+    return transfer
 
 
 # ---------------------------------------------------------------------------
@@ -742,6 +1132,9 @@ def confirm_credit(credit, user):
         StockMovement.objects.create(
             organization=invoice.hospital,
             product=line.delivery_line.requisition_line.product,
+            # Off the same shelf the receipt landed on, or the unit goes on
+            # showing stock the hospital has just written off its books.
+            unit_id=invoice.delivery.requisition.unit_id,
             kind=StockMovement.RETURN, qty=-line.qty,
             delivery=invoice.delivery,
             batch_no=line.delivery_line.batch_no,

@@ -21,6 +21,8 @@ from .models import (
     Requisition,
     RequisitionLine,
     StockMovement,
+    Transfer,
+    TransferLine,
     Unit,
     User,
 )
@@ -28,6 +30,11 @@ from .models import (
 
 class RequisitionLineInline(admin.TabularInline):
     model = RequisitionLine
+    extra = 0
+
+
+class TransferLineInline(admin.TabularInline):
+    model = TransferLine
     extra = 0
 
 
@@ -45,7 +52,7 @@ class OrganizationAdmin(admin.ModelAdmin):
 
 @admin.register(User)
 class UserAdmin(admin.ModelAdmin):
-    list_display = ['phone', 'full_name', 'organization', 'role', 'is_active']
+    list_display = ['phone', 'full_name', 'organization', 'unit', 'role', 'is_active']
     list_filter = ['role', 'is_active', 'organization__kind']
     search_fields = ['phone', 'full_name']
 
@@ -85,6 +92,14 @@ class PaymentAdmin(admin.ModelAdmin):
     list_display = ['reference', 'invoice', 'amount', 'method', 'status', 'recorded_at']
     list_filter = ['status', 'method']
     search_fields = ['reference', 'payer_reference', 'invoice__reference']
+
+
+@admin.register(Transfer)
+class TransferAdmin(admin.ModelAdmin):
+    list_display = ['reference', 'hospital', 'from_unit', 'to_unit', 'status', 'created_at']
+    list_filter = ['status']
+    search_fields = ['reference', 'from_unit__name', 'to_unit__name']
+    inlines = [TransferLineInline]
 
 
 @admin.register(AuditLog)

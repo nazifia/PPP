@@ -324,10 +324,16 @@ class ProfileTile extends StatelessWidget {
   Widget build(BuildContext context) {
     final api = ApiScope.of(context);
     final user = api.user ?? const <String, dynamic>{};
+    // The unit is worth saying: it is what decides whose stock this account may
+    // hand over, and an account on none of them can only ask.
+    final unit = '${user['unit_name'] ?? ''}';
     return ListTile(
       leading: const CircleAvatar(child: Icon(Icons.person)),
       title: Text('${user['full_name']}'),
-      subtitle: Text('${user['phone']} · ${user['role']} · ${user['organization_name'] ?? ''}'),
+      subtitle: Text(
+        '${user['phone']} · ${user['role']} · ${user['organization_name'] ?? ''}'
+        '${unit.isEmpty ? '' : '\n$unit'}',
+      ),
     );
   }
 }

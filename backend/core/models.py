@@ -155,6 +155,14 @@ class User(AbstractBaseUser, PermissionsMixin):
         Organization, null=True, blank=True, on_delete=models.CASCADE, related_name='users',
     )
     role = models.CharField(max_length=8, choices=Role.choices, default=Role.STAFF)
+    #: Which unit this account works on, where the organisation is divided that
+    #: far. It is what says whose shelf a person may hand stock off, so a
+    #: transfer between two units answers to the people standing at each of
+    #: them. Blank for a supplier, for an administrator, and for anyone whose
+    #: hospital keeps no units.
+    unit = models.ForeignKey(
+        'Unit', null=True, blank=True, on_delete=models.SET_NULL, related_name='members',
+    )
     job_title = models.CharField(max_length=80, blank=True)
     must_change_password = models.BooleanField(default=False)
     is_active = models.BooleanField(default=True)
@@ -845,18 +853,26 @@ class StockMovement(models.Model):
     RETURN = 'RETURN'
     ADJUST = 'ADJUST'
     DISPENSE = 'DISPENSE'
+    TRANSFER = 'TRANSFER'
     KIND_CHOICES = [
         (ISSUE, 'Issued by supplier'),
         (RECEIPT, 'Received by hospital'),
         (RETURN, 'Returned to supplier'),
         (ADJUST, 'Manual adjustment'),
         (DISPENSE, 'Dispensed by hospital'),
+        (TRANSFER, 'Moved between units'),
     ]
 
     organization = models.ForeignKey(
         Organization, on_delete=models.CASCADE, related_name='stock_movements',
     )
     product = models.ForeignKey(Product, on_delete=models.CASCADE, related_name='movements')
+    #: Whose shelf the goods sat on. Blank is the organisation's own store: every
+    #: row written before units could hold stock reads that way, and so does
+    #: anything received against a request that named only a department.
+    unit = models.ForeignKey(
+        Unit, null=True, blank=True, on_delete=models.SET_NULL, related_name='stock_movements',
+    )
     kind = models.CharField(max_length=10, choices=KIND_CHOICES)
     qty = quantity_field(help_text='Signed against the organization holding it.')
     delivery = models.ForeignKey(
@@ -881,7 +897,132 @@ class StockMovement(models.Model):
             models.Index(fields=['organization', '-created_at']),
             # The shelf-check: what this tenant holds that is going out of date.
             models.Index(fields=['organization', 'expiry_date']),
+            # The same running balance asked one shelf down, which is what every
+            # transfer between units checks before it moves anything.
+            models.Index(fields=['unit', 'product']),
         ]
+
+
+class TransferStatus(models.TextChoices):
+    REQUESTED = 'REQUESTED', 'Requested, awaiting the holding unit'
+    APPROVED = 'APPROVED', 'Agreed, awaiting the goods'
+    ISSUED = 'ISSUED', 'Handed over, awaiting confirmation'
+    RECEIVED = 'RECEIVED', 'Confirmed received'
+    REJECTED = 'REJECTED', 'Refused by the holding unit'
+    CANCELLED = 'CANCELLED', 'Withdrawn by the asking unit'
+
+
+#: Nothing has moved yet, so the asking unit may still take the request back.
+TRANSFER_OPEN_STATUSES = [TransferStatus.REQUESTED, TransferStatus.APPROVED]
+
+
+class Transfer(models.Model):
+    """One unit asking another in its own department for stock it holds.
+
+    Nothing is bought here and no invoice is raised: the goods are already the
+    hospital's, and all that moves is which shelf they sit on. Shaped like a
+    requisition because it answers the same questions, and in the same order:
+    the holding unit agrees to a quantity, hands over what it actually can, and
+    the asking unit says what turned up.
+
+    Both units must sit in the same department. A ward borrowing from another
+    department is a different arrangement, with a different person signing for
+    it, and until somebody asks for that this refuses it rather than guessing.
+    """
+
+    reference = models.CharField(max_length=16, unique=True, default=new_reference)
+    #: Held rather than reached through the units, so a transfer stays on its
+    #: hospital's books even if a unit is deleted out from under it.
+    hospital = models.ForeignKey(
+        Organization, on_delete=models.CASCADE, related_name='transfers',
+    )
+    from_unit = models.ForeignKey(
+        Unit, null=True, blank=True, on_delete=models.SET_NULL, related_name='transfers_out',
+        help_text='The unit being asked, which holds the stock.',
+    )
+    to_unit = models.ForeignKey(
+        Unit, null=True, blank=True, on_delete=models.SET_NULL, related_name='transfers_in',
+        help_text='The unit that asked, which the stock moves to.',
+    )
+    status = models.CharField(
+        max_length=10, choices=TransferStatus.choices, default=TransferStatus.REQUESTED,
+    )
+    note = models.TextField(blank=True)
+    requested_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, null=True, on_delete=models.SET_NULL,
+        related_name='transfers_requested',
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    decided_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL,
+        related_name='transfers_decided',
+    )
+    decided_at = models.DateTimeField(null=True, blank=True)
+    decision_note = models.CharField(
+        max_length=255, blank=True,
+        help_text='What the holding unit said when it agreed, refused, or was stood down.',
+    )
+    #: Who carried the goods out of the store, as against who agreed to it. The
+    #: same person often does both, and the record does not assume it.
+    issued_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL,
+        related_name='transfers_issued',
+    )
+    issued_at = models.DateTimeField(null=True, blank=True)
+    issue_note = models.CharField(max_length=255, blank=True)
+    received_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL,
+        related_name='transfers_received',
+    )
+    received_at = models.DateTimeField(null=True, blank=True)
+    receipt_note = models.CharField(max_length=255, blank=True)
+
+    class Meta:
+        ordering = ['-created_at']
+        indexes = [
+            # The two lists each side of the trade: what my unit is waiting on,
+            # and what my unit has been asked for.
+            models.Index(fields=['from_unit', 'status']),
+            models.Index(fields=['to_unit', 'status']),
+            models.Index(fields=['hospital', '-created_at']),
+        ]
+
+    def __str__(self):
+        return f'{self.reference} {self.from_unit} -> {self.to_unit}'
+
+    @property
+    def department_name(self):
+        """The department both units belong to, which is the whole point of it."""
+        unit = self.from_unit or self.to_unit
+        return unit.department.name if unit else ''
+
+    @property
+    def is_open(self):
+        """Still waiting on somebody, and nothing has left a shelf yet."""
+        return self.status in TRANSFER_OPEN_STATUSES
+
+
+class TransferLine(models.Model):
+    transfer = models.ForeignKey(Transfer, on_delete=models.CASCADE, related_name='lines')
+    product = models.ForeignKey(Product, on_delete=models.PROTECT, related_name='transfer_lines')
+    qty_requested = quantity_field(default=Decimal('1'))
+    qty_approved = quantity_field(default=Decimal('0'))
+    qty_issued = quantity_field(default=Decimal('0'))
+    #: What the asking unit says turned up. Short of what was issued means goods
+    #: that left one shelf and never reached the other, which the receipt writes
+    #: off the asking unit's ledger rather than leaving on it.
+    qty_received = quantity_field(default=Decimal('0'))
+    shortfall_reason = models.CharField(max_length=255, blank=True)
+
+    class Meta:
+        ordering = ['id']
+        # The same item asked for twice is one line of more of it, as it is on a
+        # requisition. Two rows would each be checked against the shelf on their
+        # own and could take more off it between them than it holds.
+        unique_together = [('transfer', 'product')]
+
+    def __str__(self):
+        return f'{self.product} x{self.qty_requested}'
 
 
 class AuditLog(models.Model):

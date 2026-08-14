@@ -23,6 +23,7 @@ from rest_framework.authtoken.models import Token
 from rest_framework.test import APITestCase
 
 from .models import (
+    AuditLog,
     Delivery,
     DeliveryStatus,
     Department,
@@ -2949,3 +2950,537 @@ class RuntimeModeTests(TestCase):
         self.client.force_login(self.superuser)
         self.switch('prod')
         self.assertIsNone(self.saved())
+
+
+class UnitTransferTests(APITestCase):
+    """One unit borrowing from another in its own department.
+
+    Nothing is bought here, so there is no invoice to check: what matters is
+    that the goods leave one shelf and land on the other, that the hospital's
+    own total does not move, and that each of the four steps is signed by
+    somebody who was entitled to take it.
+    """
+
+    def setUp(self):
+        cache.clear()
+        self.hospital = Organization.objects.create(
+            name='General Hospital', kind=OrgKind.HOSPITAL, phone='08000000001',
+        )
+        self.admin = User.objects.create_user(
+            phone='08011111111', password='Sup3rSecret!', full_name='Hospital Admin',
+            organization=self.hospital, role=Role.ADMIN,
+        )
+        self.supplier = Organization.objects.create(
+            name='Valour Pharmaceuticals', kind=OrgKind.SUPPLIER, phone='08000000002',
+        )
+        Partnership.objects.create(hospital=self.hospital, supplier=self.supplier)
+        self.product = Product.objects.create(
+            supplier=self.supplier, generic_name='10% Dextrose Water',
+            unit=DispensingUnit.objects.get(supplier=None, name='CARTON'),
+            unit_price='720.00', stock_qty=100,
+        )
+        self.laboratory = Department.objects.create(
+            organization=self.hospital, name='LABORATORY',
+        )
+        self.haematology = Unit.objects.create(
+            department=self.laboratory, name='HAEMATOLOGY',
+        )
+        self.chemistry = Unit.objects.create(department=self.laboratory, name='CHEMISTRY')
+        self.pharmacy = Department.objects.create(organization=self.hospital, name='PHARMACY')
+        self.dispensary = Unit.objects.create(department=self.pharmacy, name='DISPENSARY')
+
+        self.holder = User.objects.create_user(
+            phone='08033333333', password='Sup3rSecret!', full_name='Haematology Staff',
+            organization=self.hospital, role=Role.STAFF, unit=self.haematology,
+        )
+        self.asker = User.objects.create_user(
+            phone='08055555555', password='Sup3rSecret!', full_name='Chemistry Staff',
+            organization=self.hospital, role=Role.STAFF, unit=self.chemistry,
+        )
+        # Somebody nobody has placed on a unit yet.
+        self.unplaced = User.objects.create_user(
+            phone='08066666666', password='Sup3rSecret!', full_name='Ward Staff',
+            organization=self.hospital, role=Role.STAFF,
+        )
+
+    def login(self, user):
+        phone = getattr(user, 'phone', user)
+        response = self.client.post(
+            reverse('login'), {'phone': phone, 'password': 'Sup3rSecret!'}, format='json',
+        )
+        self.assertEqual(response.status_code, 200, response.data)
+        self.client.credentials(HTTP_AUTHORIZATION='Token ' + response.data['token'])
+        return response.data
+
+    def stock(self, unit, qty):
+        """Put stock on a unit's shelf the way a verified delivery would."""
+        return StockMovement.objects.create(
+            organization=self.hospital, product=self.product, unit=unit,
+            kind=StockMovement.RECEIPT, qty=qty, note='Opening',
+        )
+
+    def balance(self, unit=None):
+        query = f'?unit={unit.id}' if unit is not None else ''
+        rows = self.client.get(f'/api/stock-movements/balances/{query}').data
+        return next((row['balance'] for row in rows if row['product'] == self.product.id), None)
+
+    def ask(self, qty=8, from_unit=None, to_unit=None):
+        return self.client.post('/api/transfers/', {
+            'from_unit': (from_unit or self.haematology).id,
+            'to_unit': (to_unit or self.chemistry).id,
+            'items': [{'product': self.product.id, 'qty': qty}],
+            'note': 'Run out before the round',
+        }, format='json')
+
+    def step(self, transfer_id, name, payload):
+        return self.client.post(f'/api/transfers/{transfer_id}/{name}/', payload, format='json')
+
+    def requested(self, qty=8):
+        """A transfer sitting at REQUESTED, and the id of its only line."""
+        self.login(self.asker)
+        asked = self.ask(qty)
+        self.assertEqual(asked.status_code, 201, asked.data)
+        return asked.data['id'], asked.data['lines'][0]['id']
+
+    def test_the_four_steps_move_stock_and_each_one_is_signed(self):
+        self.stock(self.haematology, 20)
+        transfer_id, line_id = self.requested(8)
+
+        # Asking alone moves nothing.
+        self.assertEqual(self.balance(self.haematology), Decimal('20.0'))
+
+        self.login(self.holder)
+        approved = self.step(transfer_id, 'approve', {
+            'items': [{'line': line_id, 'qty_approved': 6}], 'note': 'Six we can spare',
+        })
+        self.assertEqual(approved.status_code, 200, approved.data)
+        self.assertEqual(approved.data['status'], 'APPROVED')
+        self.assertEqual(approved.data['decided_by_name'], 'Haematology Staff')
+        self.assertEqual(Decimal(str(approved.data['lines'][0]['qty_approved'])), Decimal('6.0'))
+        # Agreement is not delivery: the shelf has not moved yet.
+        self.assertEqual(self.balance(self.haematology), Decimal('20.0'))
+
+        issued = self.step(transfer_id, 'issue', {
+            'items': [{'line': line_id, 'qty': 5}], 'note': 'Five counted out',
+        })
+        self.assertEqual(issued.status_code, 200, issued.data)
+        self.assertEqual(issued.data['status'], 'ISSUED')
+        self.assertEqual(Decimal(str(issued.data['lines'][0]['qty_issued'])), Decimal('5.0'))
+        self.assertEqual(self.balance(self.haematology), Decimal('15.0'))
+
+        # An empty confirmation is the ordinary one: all of it turned up.
+        self.login(self.asker)
+        received = self.step(transfer_id, 'receive', {})
+        self.assertEqual(received.status_code, 200, received.data)
+        self.assertEqual(received.data['status'], 'RECEIVED')
+        self.assertEqual(received.data['received_by_name'], 'Chemistry Staff')
+        self.assertEqual(Decimal(str(received.data['lines'][0]['qty_received'])), Decimal('5.0'))
+
+        self.assertEqual(self.balance(self.haematology), Decimal('15.0'))
+        self.assertEqual(self.balance(self.chemistry), Decimal('5.0'))
+        # The hospital still holds every carton it held before.
+        self.assertEqual(self.balance(), Decimal('20.0'))
+
+        moves = StockMovement.objects.filter(kind=StockMovement.TRANSFER)
+        self.assertEqual(moves.count(), 2)
+        self.assertEqual(moves.aggregate(total=Sum('qty'))['total'], Decimal('0'))
+        self.assertEqual(
+            set(AuditLog.objects.filter(entity='Transfer').values_list('action', flat=True)),
+            {'REQUESTED', 'APPROVED', 'ISSUED', 'RECEIVED'},
+        )
+
+    def test_what_never_arrived_is_written_off_the_asking_units_shelf(self):
+        self.stock(self.haematology, 20)
+        transfer_id, line_id = self.requested(8)
+        self.login(self.holder)
+        self.step(transfer_id, 'approve', {'items': [{'line': line_id, 'qty_approved': 5}]})
+        self.step(transfer_id, 'issue', {'items': [{'line': line_id, 'qty': 5}]})
+
+        self.login(self.asker)
+        # A short count has to say what happened to the rest.
+        silent = self.step(transfer_id, 'receive', {
+            'items': [{'line': line_id, 'qty_received': 3}],
+        })
+        self.assertEqual(silent.status_code, 400)
+        # Nor can more arrive than was ever sent.
+        self.assertEqual(
+            self.step(transfer_id, 'receive', {
+                'items': [{'line': line_id, 'qty_received': 9, 'reason': 'found extra'}],
+            }).status_code,
+            400,
+        )
+
+        received = self.step(transfer_id, 'receive', {
+            'items': [{
+                'line': line_id, 'qty_received': 3, 'reason': 'two cartons never came over',
+            }],
+        })
+        self.assertEqual(received.status_code, 200, received.data)
+        self.assertEqual(
+            received.data['lines'][0]['shortfall_reason'], 'two cartons never came over',
+        )
+
+        self.assertEqual(self.balance(self.haematology), Decimal('15.0'))
+        self.assertEqual(self.balance(self.chemistry), Decimal('3.0'))
+        # The two that went missing are off the hospital's books, not sitting on
+        # a shelf nobody can find them on.
+        self.assertEqual(self.balance(), Decimal('18.0'))
+        written_off = StockMovement.objects.get(kind=StockMovement.ADJUST)
+        self.assertEqual(written_off.qty, Decimal('-2.0'))
+        self.assertEqual(written_off.unit_id, self.chemistry.pk)
+
+    def test_each_unit_answers_for_its_own_half_of_the_trade(self):
+        self.stock(self.haematology, 20)
+        transfer_id, line_id = self.requested(8)
+
+        # The unit being asked does not get to raise the request for the other.
+        self.login(self.holder)
+        self.assertEqual(self.ask().status_code, 403)
+        # Nor does anybody nobody has placed on a unit.
+        self.login(self.unplaced)
+        self.assertEqual(self.ask().status_code, 403)
+        self.assertEqual(
+            self.step(transfer_id, 'approve', {
+                'items': [{'line': line_id, 'qty_approved': 1}],
+            }).status_code,
+            403,
+        )
+
+        # The asking unit cannot agree to the other's stock, or hand it over.
+        self.login(self.asker)
+        for name, payload in (
+            ('approve', {'items': [{'line': line_id, 'qty_approved': 6}]}),
+            ('reject', {'reason': 'no'}),
+        ):
+            self.assertEqual(self.step(transfer_id, name, payload).status_code, 403)
+
+        self.login(self.holder)
+        self.step(transfer_id, 'approve', {'items': [{'line': line_id, 'qty_approved': 6}]})
+        self.login(self.asker)
+        self.assertEqual(
+            self.step(transfer_id, 'issue', {
+                'items': [{'line': line_id, 'qty': 6}],
+            }).status_code,
+            403,
+        )
+        # And the holding unit does not sign for what the other received.
+        self.login(self.holder)
+        self.step(transfer_id, 'issue', {'items': [{'line': line_id, 'qty': 6}]})
+        self.assertEqual(self.step(transfer_id, 'receive', {}).status_code, 403)
+
+        # An administrator stands in for either side.
+        self.login(self.admin)
+        self.assertEqual(self.step(transfer_id, 'receive', {}).status_code, 200)
+
+    def test_the_steps_are_taken_in_order_and_only_once(self):
+        self.stock(self.haematology, 20)
+        transfer_id, line_id = self.requested(8)
+
+        self.login(self.holder)
+        # Nothing is issued before it is agreed, and nothing is received before
+        # it is issued.
+        self.assertEqual(
+            self.step(transfer_id, 'issue', {
+                'items': [{'line': line_id, 'qty': 1}],
+            }).status_code,
+            400,
+        )
+        self.step(transfer_id, 'approve', {'items': [{'line': line_id, 'qty_approved': 6}]})
+        self.login(self.asker)
+        self.assertEqual(self.step(transfer_id, 'receive', {}).status_code, 400)
+
+        # Agreeing twice, and agreeing to nothing at all, are both refused.
+        self.login(self.holder)
+        self.assertEqual(
+            self.step(transfer_id, 'approve', {
+                'items': [{'line': line_id, 'qty_approved': 2}],
+            }).status_code,
+            400,
+        )
+        fresh_id, fresh_line = self.requested(4)
+        self.login(self.holder)
+        self.assertEqual(
+            self.step(fresh_id, 'approve', {
+                'items': [{'line': fresh_line, 'qty_approved': 0}],
+            }).status_code,
+            400,
+        )
+        self.assertEqual(
+            self.step(fresh_id, 'approve', {
+                'items': [{'line': fresh_line, 'qty_approved': 9}],
+            }).status_code,
+            400,
+        )
+
+        # An agreed transfer may still be withdrawn; an issued one may not.
+        self.login(self.asker)
+        cancelled = self.step(transfer_id, 'cancel', {'reason': 'Found some in the cupboard'})
+        self.assertEqual(cancelled.status_code, 200, cancelled.data)
+        self.assertEqual(cancelled.data['status'], 'CANCELLED')
+
+        self.login(self.holder)
+        self.step(fresh_id, 'approve', {'items': [{'line': fresh_line, 'qty_approved': 4}]})
+        self.step(fresh_id, 'issue', {'items': [{'line': fresh_line, 'qty': 4}]})
+        self.login(self.asker)
+        self.assertEqual(self.step(fresh_id, 'cancel', {'reason': 'too late'}).status_code, 400)
+        self.assertEqual(self.balance(self.haematology), Decimal('16.0'))
+
+    def test_only_units_of_one_department_trade_with_each_other(self):
+        self.stock(self.haematology, 20)
+        self.login(self.asker)
+
+        # Another department, itself, and a retired unit are all refused.
+        self.assertEqual(self.ask(to_unit=self.dispensary).status_code, 400)
+        self.assertEqual(self.ask(to_unit=self.haematology).status_code, 400)
+        Unit.objects.filter(pk=self.chemistry.pk).update(is_active=False)
+        self.assertEqual(self.ask().status_code, 400)
+        Unit.objects.filter(pk=self.chemistry.pk).update(is_active=True)
+        self.assertEqual(self.ask().status_code, 201)
+
+    def test_a_unit_cannot_issue_more_than_it_holds(self):
+        self.stock(self.haematology, 3)
+        # The hospital holds plenty; the shelf being asked does not.
+        self.stock(self.dispensary, 500)
+        transfer_id, line_id = self.requested(5)
+
+        self.login(self.holder)
+        self.step(transfer_id, 'approve', {'items': [{'line': line_id, 'qty_approved': 5}]})
+        refused = self.step(transfer_id, 'issue', {'items': [{'line': line_id, 'qty': 5}]})
+        self.assertEqual(refused.status_code, 400)
+        self.assertIn('holds only 3', str(refused.data))
+
+        # More than was agreed, and nothing at all, are both refused.
+        for qty in (6, 0):
+            self.assertEqual(
+                self.step(transfer_id, 'issue', {
+                    'items': [{'line': line_id, 'qty': qty}],
+                }).status_code,
+                400,
+            )
+        self.assertEqual(self.balance(self.haematology), Decimal('3.0'))
+
+    def test_a_request_can_be_refused_and_nothing_moves(self):
+        self.stock(self.haematology, 20)
+        transfer_id, line_id = self.requested()
+
+        self.login(self.holder)
+        # A refusal has to say why.
+        self.assertEqual(self.step(transfer_id, 'reject', {}).status_code, 400)
+        rejected = self.step(transfer_id, 'reject', {'reason': 'We are short ourselves'})
+        self.assertEqual(rejected.status_code, 200, rejected.data)
+        self.assertEqual(rejected.data['status'], 'REJECTED')
+        self.assertEqual(rejected.data['decision_note'], 'We are short ourselves')
+        self.assertEqual(
+            self.step(transfer_id, 'approve', {
+                'items': [{'line': line_id, 'qty_approved': 1}],
+            }).status_code,
+            400,
+        )
+
+        self.assertEqual(self.balance(self.haematology), Decimal('20.0'))
+        self.assertFalse(StockMovement.objects.filter(kind=StockMovement.TRANSFER).exists())
+
+        # It stays on the list, which is the record of what was asked.
+        self.assertEqual(self.client.get('/api/transfers/pending/').data['count'], 0)
+        self.assertEqual(self.client.get('/api/transfers/').data['count'], 1)
+
+    def test_a_transfer_belongs_to_its_own_hospital(self):
+        self.stock(self.haematology, 20)
+        transfer_id, line_id = self.requested()
+
+        other = Organization.objects.create(
+            name='Cottage Hospital', kind=OrgKind.HOSPITAL, phone='08000000009',
+        )
+        User.objects.create_user(
+            phone='08044444444', password='Sup3rSecret!', full_name='Other Admin',
+            organization=other, role=Role.ADMIN,
+        )
+        self.login('08044444444')
+        self.assertEqual(self.client.get('/api/transfers/').data['count'], 0)
+        self.assertEqual(
+            self.step(transfer_id, 'approve', {
+                'items': [{'line': line_id, 'qty_approved': 1}],
+            }).status_code,
+            404,
+        )
+        # Nor may it name another hospital's units on one of its own.
+        self.assertEqual(self.ask().status_code, 403)
+
+    def test_a_member_of_staff_cannot_move_themselves_to_another_unit(self):
+        self.login(self.asker)
+        response = self.client.patch(
+            '/api/auth/me/', {'unit': self.haematology.id, 'job_title': 'Chief'}, format='json',
+        )
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(response.data['job_title'], 'Chief')
+        self.asker.refresh_from_db()
+        self.assertEqual(self.asker.unit_id, self.chemistry.pk)
+
+        # The administrator places people, and only inside its own hospital.
+        self.login(self.admin)
+        moved = self.client.patch(
+            f'/api/users/{self.asker.pk}/', {'unit': self.haematology.id}, format='json',
+        )
+        self.assertEqual(moved.status_code, 200, moved.data)
+        self.asker.refresh_from_db()
+        self.assertEqual(self.asker.unit_id, self.haematology.pk)
+
+        other = Organization.objects.create(
+            name='Cottage Hospital', kind=OrgKind.HOSPITAL, phone='08000000009',
+        )
+        elsewhere = Unit.objects.create(
+            department=Department.objects.create(organization=other, name='THEATRE'),
+            name='RECOVERY',
+        )
+        self.assertEqual(
+            self.client.patch(
+                f'/api/users/{self.asker.pk}/', {'unit': elsewhere.id}, format='json',
+            ).status_code,
+            400,
+        )
+
+    def test_goods_land_on_the_shelf_of_the_unit_that_asked_for_them(self):
+        self.login(self.admin)
+        asked = self.client.post('/api/requisitions/wishlist/add/', {
+            'product': self.product.id, 'qty': 10,
+            'department': self.laboratory.id, 'unit': self.haematology.id,
+        }, format='json')
+        self.assertEqual(asked.status_code, 201, asked.data)
+        requisition_id, line_id = asked.data['id'], asked.data['lines'][0]['id']
+        self.client.post(f'/api/requisitions/{requisition_id}/submit/', format='json')
+
+        supplier_admin = User.objects.create_user(
+            phone='08022222222', password='Sup3rSecret!', full_name='Supplier Admin',
+            organization=self.supplier, role=Role.ADMIN,
+        )
+        self.login(supplier_admin)
+        self.client.post(
+            f'/api/requisitions/{requisition_id}/decide/',
+            {'lines': [{'line': line_id, 'qty_approved': 10}]}, format='json',
+        )
+        dispatched = self.client.post(
+            f'/api/requisitions/{requisition_id}/dispatch/',
+            {'items': [{'line': line_id, 'qty': 10, 'batch_no': 'B-1'}]}, format='json',
+        )
+        self.login(self.admin)
+        verified = self.client.post(
+            f"/api/deliveries/{dispatched.data['id']}/verify/",
+            {'lines': [{'line': dispatched.data['lines'][0]['id'], 'qty_accepted': 10}]},
+            format='json',
+        )
+        self.assertEqual(verified.status_code, 200, verified.data)
+
+        receipt = StockMovement.objects.get(kind=StockMovement.RECEIPT)
+        self.assertEqual(receipt.unit_id, self.haematology.pk)
+        self.assertEqual(self.balance(self.haematology), Decimal('10.0'))
+
+        # A dispense off that shelf comes off it, not off the hospital at large.
+        self.client.post('/api/stock-movements/dispense/', {
+            'product': self.product.id, 'qty': 4, 'unit': self.haematology.id,
+        }, format='json')
+        self.assertEqual(self.balance(self.haematology), Decimal('6.0'))
+        self.assertEqual(
+            self.client.post('/api/stock-movements/dispense/', {
+                'product': self.product.id, 'qty': 99, 'unit': self.haematology.id,
+            }, format='json').status_code,
+            400,
+        )
+
+    def test_a_unit_holding_stock_cannot_be_deleted_out_from_under_it(self):
+        self.stock(self.haematology, 20)
+        self.login(self.admin.phone)
+
+        # Its shelf would land in the organisation's store with nothing to say
+        # it ever moved, so the row is kept and retiring is offered instead.
+        refused = self.client.delete(f'/api/units/{self.haematology.pk}/')
+        self.assertEqual(refused.status_code, 400)
+        self.assertIn('Retire it instead', str(refused.data))
+        # And the department cannot take it down the back way either.
+        self.assertEqual(
+            self.client.delete(f'/api/departments/{self.laboratory.pk}/').status_code, 400,
+        )
+
+        # A unit that has never held anything is nobody's record, and still goes.
+        empty = Unit.objects.create(department=self.laboratory, name='SEROLOGY')
+        self.assertEqual(self.client.delete(f'/api/units/{empty.pk}/').status_code, 204)
+
+        # Retiring is what closes a unit to new work, and it still answers.
+        retired = self.client.patch(
+            f'/api/units/{self.haematology.pk}/', {'is_active': False}, format='json',
+        )
+        self.assertEqual(retired.status_code, 200, retired.data)
+        self.assertTrue(Unit.objects.filter(pk=self.haematology.pk).exists())
+
+    def test_a_unit_with_an_open_transfer_cannot_be_deleted(self):
+        # No stock anywhere, so only the transfer stands in the way.
+        self.login(self.asker)
+        self.ask(1)
+        self.login(self.admin.phone)
+        self.assertEqual(
+            self.client.delete(f'/api/units/{self.chemistry.pk}/').status_code, 400,
+        )
+
+    def test_the_store_is_a_shelf_of_its_own_when_stock_is_dispensed(self):
+        self.stock(self.haematology, 20)
+        self.login(self.admin.phone)
+
+        # Twenty cartons in the building, none of them at the central counter.
+        refused = self.client.post('/api/stock-movements/dispense/', {
+            'product': self.product.id, 'qty': 1,
+        }, format='json')
+        self.assertEqual(refused.status_code, 400)
+        self.assertIn('in the store', str(refused.data))
+
+        # Off the shelf that is actually holding them, it goes through.
+        self.assertEqual(
+            self.client.post('/api/stock-movements/dispense/', {
+                'product': self.product.id, 'qty': 1, 'unit': self.haematology.id,
+            }, format='json').status_code,
+            201,
+        )
+        self.assertEqual(self.balance(self.haematology), Decimal('19.0'))
+
+    def test_the_dashboard_counts_what_is_still_waiting_on_somebody(self):
+        self.stock(self.haematology, 20)
+        transfer_id, line_id = self.requested(8)
+
+        self.login(self.admin.phone)
+        self.assertEqual(self.client.get('/api/dashboard/').data['transfers_pending'], 1)
+
+        self.step(transfer_id, 'approve', {'items': [{'line': line_id, 'qty_approved': 5}]})
+        self.step(transfer_id, 'issue', {'items': [{'line': line_id, 'qty': 5}]})
+        # Handed over is still waiting: nobody has signed for it.
+        self.assertEqual(self.client.get('/api/dashboard/').data['transfers_pending'], 1)
+
+        self.step(transfer_id, 'receive', {})
+        self.assertEqual(self.client.get('/api/dashboard/').data['transfers_pending'], 0)
+
+    def test_a_transfer_note_prints_what_both_ends_sign(self):
+        self.stock(self.haematology, 20)
+        transfer_id, line_id = self.requested(8)
+        self.login(self.holder)
+        self.step(transfer_id, 'approve', {'items': [{'line': line_id, 'qty_approved': 5}]})
+        self.step(transfer_id, 'issue', {'items': [{'line': line_id, 'qty': 5}]})
+
+        sheet = self.client.get(f'/api/transfers/{transfer_id}/print/')
+        self.assertEqual(sheet.status_code, 200)
+        self.assertEqual(sheet['Content-Type'], 'application/pdf')
+        text = ' '.join(
+            page.extract_text() or '' for page in PdfReader(io.BytesIO(sheet.content)).pages
+        )
+        # The item name wraps inside its column, so match a word of it rather
+        # than the whole label.
+        for expected in ('STOCK TRANSFER NOTE', 'HAEMATOLOGY', 'CHEMISTRY', 'Dextrose'):
+            self.assertIn(expected, text)
+
+        # The ledger sheet says which shelf it covers, so a filtered one cannot
+        # read as the whole hospital's.
+        ledger = self.client.get(
+            '/api/stock-movements/print/', {'unit': self.haematology.id},
+        )
+        self.assertEqual(ledger.status_code, 200)
+        ledger_text = ' '.join(
+            page.extract_text() or '' for page in PdfReader(io.BytesIO(ledger.content)).pages
+        )
+        self.assertIn('Shelf', ledger_text)
+        self.assertIn('HAEMATOLOGY', ledger_text)

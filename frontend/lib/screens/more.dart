@@ -6,6 +6,7 @@ import '../main.dart';
 import '../ui.dart';
 import 'deliveries.dart';
 import 'login.dart';
+import 'transfers.dart';
 
 /// What the server accepts as a payment receipt. Kept in step with
 /// `RECEIPT_EXTENSIONS` and `RECEIPT_MAX_BYTES` in core/models.py.
@@ -109,6 +110,15 @@ class MoreScreen extends StatelessWidget {
               subtitle: const Text('Every item in and out'),
               onTap: () => open(const StockLedgerScreen()),
             ),
+            // Between two units of one department, so it only exists where an
+            // organisation is divided that far — which is a hospital.
+            if (api.canActAsHospital)
+              ListTile(
+                leading: const Icon(Icons.swap_horiz),
+                title: const Text('Unit transfers'),
+                subtitle: const Text('Borrow stock from another unit of your department'),
+                onTap: () => open(const TransfersScreen()),
+              ),
             // A supplier's stock carries no expiry date until it is delivered,
             // so the shelf check belongs to whoever is holding the shelf.
             if (api.canActAsHospital)
@@ -782,6 +792,7 @@ class _UsersScreenState extends State<UsersScreen> {
                         title: Text('${user['full_name']}'),
                         subtitle: Text(
                           '${user['phone']} · ${user['role']}'
+                          '${'${user['unit_name'] ?? ''}'.isEmpty ? '' : ' · ${user['unit_name']}'}'
                           '${user['is_active'] == true ? '' : ' · disabled'}',
                         ),
                         trailing: api.isAdmin
@@ -870,6 +881,12 @@ class _UserDialogState extends State<_UserDialog> {
     if (widget.user == null) 'password': TextEditingController(),
   };
   late String _role = '${widget.user?['role'] ?? 'STAFF'}';
+
+  /// Which unit this person works on. It is what lets them agree to a transfer
+  /// out of that unit's stock, or sign for what arrives — see `require_unit_member`
+  /// in core/services.py — so it is granted here rather than chosen by the
+  /// account itself.
+  late String _unit = '${widget.user?['unit'] ?? ''}';
   bool _busy = false;
 
   bool get _editing => widget.user != null;
@@ -913,6 +930,14 @@ class _UserDialogState extends State<_UserDialog> {
                 ],
                 onSelected: (value) => setState(() => _role = value ?? 'STAFF'),
               ),
+              // Draws nothing where the organisation keeps no units, which is
+              // every supplier and any hospital that has not divided itself up.
+              _UnitField(
+                label: 'Unit',
+                placeholder: 'No particular unit',
+                value: _unit,
+                onSelected: (value) => setState(() => _unit = value),
+              ),
             ],
           ),
         ),
@@ -930,9 +955,11 @@ class _UserDialogState extends State<_UserDialog> {
                   final org = _editing ? const <String, dynamic>{} : await orgField(context, api);
                   if (org == null || !context.mounted) return;
                   setState(() => _busy = true);
-                  final body = {
+                  final body = <String, dynamic>{
                     for (final entry in _fields.entries) entry.key: entry.value.text.trim(),
                     'role': _role,
+                    // Null clears it: an account taken off a unit acts for none.
+                    'unit': _unit.isEmpty ? null : int.parse(_unit),
                     ...org,
                   };
                   try {
@@ -1845,6 +1872,7 @@ const stockMovementKinds = {
   'ISSUE': 'Issued',
   'RETURN': 'Returned',
   'ADJUST': 'Adjusted',
+  'TRANSFER': 'Moved between units',
 };
 
 class StockLedgerScreen extends StatefulWidget {
@@ -1863,6 +1891,10 @@ class _StockLedgerScreenState extends State<StockLedgerScreen> {
   final _search = TextEditingController();
   String _kind = '';
   DateTimeRange? _range;
+
+  /// Whose shelf to read: one unit's, the organisation's own store ('store'),
+  /// or the whole organisation when it is empty.
+  String _unit = '';
 
   /// Totals per item instead of the movements themselves.
   bool _showBalances = false;
@@ -1888,6 +1920,7 @@ class _StockLedgerScreenState extends State<StockLedgerScreen> {
   Map<String, dynamic> _query(int page) => {
     'search': _search.text,
     'kind': _kind,
+    'unit': _unit,
     if (widget.product != null) 'product': '${widget.product}',
     if (_range != null) 'from': _day(_range!.start),
     if (_range != null) 'to': _day(_range!.end),
@@ -1957,10 +1990,14 @@ class _StockLedgerScreenState extends State<StockLedgerScreen> {
     final scheme = Theme.of(context).colorScheme;
     final note = '${row['note'] ?? ''}';
     final delivery = row['delivery'] as int?;
+    final unitName = '${row['unit_name'] ?? ''}';
     final lines = [
       [
         stockMovementKinds[row['kind']] ?? '${row['kind']}',
         formatDate(row['created_at'] as String?),
+        // Whose shelf it came off or landed on. Blank is the organisation's own
+        // store, which is where everything sat before units held stock.
+        if (unitName.isNotEmpty) unitName,
         // Rows from every tenant arrive mixed together for a superuser reading
         // platform-wide, so say whose movement this is.
         if (api.isSuperuser && api.actAsOrg == null) '${row['organization_name']}',
@@ -2070,6 +2107,23 @@ class _StockLedgerScreenState extends State<StockLedgerScreen> {
             onChanged: _controller.reload,
             hintText: 'Search item, movement, note',
           ),
+          // Whose shelf, where the organisation is divided into units. Draws
+          // nothing where it is not, which is every supplier.
+          Bounded(
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 12),
+              child: _UnitField(
+                placeholder: 'Anywhere',
+                extras: const {'store': 'Organisation store'},
+                padding: EdgeInsets.zero,
+                value: _unit,
+                onSelected: (value) {
+                  setState(() => _unit = value);
+                  _controller.reload();
+                },
+              ),
+            ),
+          ),
           Bounded(
             child: SizedBox(
               height: 48,
@@ -2151,13 +2205,16 @@ class _StockLedgerScreenState extends State<StockLedgerScreen> {
 /// What the ledger says this hospital holds, item by item. [query] is searched
 /// by the server across the product name and brand; [inStock] drops the items
 /// run down to nothing, which cannot be dispensed but can still be corrected.
+/// [unit] narrows it to one unit's shelf, leaving the rest of the hospital out.
 Future<List<Map<String, dynamic>>> _balances(
   Api api, {
   String query = '',
   bool inStock = false,
+  Object? unit,
 }) async {
   final rows = await api.list('/stock-movements/balances/', {
     if (query.isNotEmpty) 'search': query,
+    if (unit != null) 'unit': '$unit',
   });
   if (!inStock) return rows;
   return [
@@ -2178,6 +2235,80 @@ List<DropdownMenuEntry<Object?>> _balanceEntries(
     ),
 ];
 
+/// Whose shelf a movement is recorded against: one unit's, or the
+/// organisation's own store. Draws nothing where the organisation keeps no
+/// units, since then there is only ever the store.
+class _UnitField extends StatefulWidget {
+  const _UnitField({
+    required this.value,
+    required this.onSelected,
+    this.label = 'Shelf',
+    this.placeholder = 'Organisation store',
+    this.extras = const {},
+    this.padding = const EdgeInsets.only(top: 12),
+  });
+
+  /// A unit id as text. Empty is [placeholder], which the server reads as no
+  /// unit at all — the organisation's own store on a write, everywhere at once
+  /// on a read.
+  final String value;
+  final ValueChanged<String> onSelected;
+  final String label;
+  final String placeholder;
+
+  /// Fixed options offered after the placeholder, value to label. The ledger
+  /// uses it for `store`, which is the store on its own rather than everywhere.
+  final Map<String, String> extras;
+
+  final EdgeInsetsGeometry padding;
+
+  @override
+  State<_UnitField> createState() => _UnitFieldState();
+}
+
+class _UnitFieldState extends State<_UnitField> {
+  Future<List<Map<String, dynamic>>>? _units;
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    _units ??= ApiScope.of(context).list('/units/');
+  }
+
+  List<DropdownMenuEntry<String?>> _entries(List<Map<String, dynamic>> rows) => [
+    DropdownMenuEntry(value: '', label: widget.placeholder),
+    for (final entry in widget.extras.entries)
+      DropdownMenuEntry(value: entry.key, label: entry.value),
+    for (final row in rows)
+      DropdownMenuEntry(value: '${row['id']}', label: '${row['full_name']}'),
+  ];
+
+  @override
+  Widget build(BuildContext context) {
+    final api = ApiScope.of(context);
+    return FutureBuilder<List<Map<String, dynamic>>>(
+      future: _units,
+      builder: (context, snapshot) {
+        final rows = snapshot.data;
+        // An organisation that keeps no units has only ever had one shelf, so
+        // there is nothing here to choose between.
+        if (rows == null || rows.isEmpty) return const SizedBox.shrink();
+        return Padding(
+          padding: widget.padding,
+          child: PickerField<String?>(
+            label: widget.label,
+            value: widget.value,
+            entries: _entries(rows),
+            search: (query) async =>
+                _entries(await api.list('/units/', {if (query.isNotEmpty) 'search': query})),
+            onSelected: (value) => widget.onSelected(value ?? ''),
+          ),
+        );
+      },
+    );
+  }
+}
+
 /// Records what a ward handed out. The picker offers only what the ledger says
 /// the hospital still holds, so the commonest mistake cannot be typed at all.
 class _DispenseDialog extends StatefulWidget {
@@ -2192,16 +2323,32 @@ class _DispenseDialog extends StatefulWidget {
 class _DispenseDialogState extends State<_DispenseDialog> {
   final _qty = TextEditingController();
   final _note = TextEditingController();
-  late final Future<List<Map<String, dynamic>>> _held;
+  late Future<List<Map<String, dynamic>>> _held;
   Object? _product;
+
+  /// Whose shelf it comes off, as a unit id or empty for the organisation's own
+  /// store. An account that sits on a unit dispenses from that unit's shelf
+  /// unless it says otherwise.
+  String _unit = '';
   bool _busy = false;
 
   @override
   void initState() {
     super.initState();
     _product = widget.product;
-    _held = _balances(ApiScope.of(context), inStock: true);
+    _unit = '${ApiScope.of(context).unitId ?? ''}';
+    _held = _balances(ApiScope.of(context), inStock: true, unit: _shelf);
   }
+
+  /// What to ask the balances for: one unit, or the store on its own.
+  String get _shelf => _unit.isEmpty ? 'store' : _unit;
+
+  /// A different shelf holds different things, so the item list follows it.
+  void _pickUnit(String unit) => setState(() {
+    _unit = unit;
+    _product = null;
+    _held = _balances(ApiScope.of(context), inStock: true, unit: _shelf);
+  });
 
   @override
   void dispose() {
@@ -2225,6 +2372,7 @@ class _DispenseDialogState extends State<_DispenseDialog> {
         'product': _product,
         'qty': dispensed,
         'note': _note.text,
+        if (_unit.isNotEmpty) 'unit': int.parse(_unit),
         ...org,
       });
       if (mounted) Navigator.pop(context, true);
@@ -2249,23 +2397,30 @@ class _DispenseDialogState extends State<_DispenseDialog> {
             }
             if (snapshot.hasError) return Text('${snapshot.error}');
             final stocked = snapshot.data!;
-            if (stocked.isEmpty) {
-              return const Text('Nothing in stock to dispense.');
-            }
             return SingleChildScrollView(
               child: Column(
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  PickerField<Object?>(
-                    label: 'Item',
-                    value: stocked.any((row) => row['product'] == _product) ? _product : null,
-                    entries: _balanceEntries(stocked, 'left'),
-                    search: (query) async => _balanceEntries(
-                      await _balances(ApiScope.of(context), query: query, inStock: true),
-                      'left',
+                  _UnitField(value: _unit, onSelected: _pickUnit),
+                  const SizedBox(height: 12),
+                  if (stocked.isEmpty)
+                    const Text('Nothing on that shelf to dispense.')
+                  else
+                    PickerField<Object?>(
+                      label: 'Item',
+                      value: stocked.any((row) => row['product'] == _product) ? _product : null,
+                      entries: _balanceEntries(stocked, 'left'),
+                      search: (query) async => _balanceEntries(
+                        await _balances(
+                          ApiScope.of(context),
+                          query: query,
+                          inStock: true,
+                          unit: _shelf,
+                        ),
+                        'left',
+                      ),
+                      onSelected: (value) => setState(() => _product = value),
                     ),
-                    onSelected: (value) => setState(() => _product = value),
-                  ),
                   const SizedBox(height: 12),
                   TextField(
                     controller: _qty,
@@ -2314,20 +2469,31 @@ class _AdjustDialog extends StatefulWidget {
 class _AdjustDialogState extends State<_AdjustDialog> {
   final _qty = TextEditingController();
   final _reason = TextEditingController();
-  late final Future<List<Map<String, dynamic>>> _held;
+  late Future<List<Map<String, dynamic>>> _held;
   Object? _product;
+
+  /// Which shelf is being corrected, as a unit id. Empty is the store.
+  String _unit = '';
   bool _busy = false;
 
   @override
   void initState() {
     super.initState();
     _product = widget.product;
-    // Every item the ledger has ever heard of here, including the ones it has
-    // run down to nothing: a miscount is corrected upwards as often as down.
-    // An item with no history at all is one this hospital never received, and
-    // the server refuses it.
-    _held = _balances(ApiScope.of(context));
+    // Every item the shelf has ever heard of, including the ones it has run
+    // down to nothing: a miscount is corrected upwards as often as down. An
+    // item with no history at all is one this hospital never received, and the
+    // server refuses it.
+    _held = _balances(ApiScope.of(context), unit: 'store');
   }
+
+  void _pickUnit(String unit) => setState(() {
+    _unit = unit;
+    _product = null;
+    // One unit's shelf, or the store on its own — which is what the correction
+    // will be written against.
+    _held = _balances(ApiScope.of(context), unit: unit.isEmpty ? 'store' : unit);
+  });
 
   @override
   void dispose() {
@@ -2355,6 +2521,7 @@ class _AdjustDialogState extends State<_AdjustDialog> {
         'product': _product,
         'qty': change,
         'reason': _reason.text.trim(),
+        if (_unit.isNotEmpty) 'unit': int.parse(_unit),
         ...org,
       });
       if (mounted) Navigator.pop(context, true);
@@ -2379,23 +2546,29 @@ class _AdjustDialogState extends State<_AdjustDialog> {
             }
             if (snapshot.hasError) return Text('${snapshot.error}');
             final rows = snapshot.data!;
-            if (rows.isEmpty) {
-              return const Text('Nothing has been received here yet.');
-            }
             return SingleChildScrollView(
               child: Column(
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  PickerField<Object?>(
-                    label: 'Item',
-                    value: rows.any((row) => row['product'] == _product) ? _product : null,
-                    entries: _balanceEntries(rows, 'on the books'),
-                    search: (query) async => _balanceEntries(
-                      await _balances(ApiScope.of(context), query: query),
-                      'on the books',
+                  _UnitField(value: _unit, onSelected: _pickUnit),
+                  const SizedBox(height: 12),
+                  if (rows.isEmpty)
+                    const Text('Nothing has been received on that shelf yet.')
+                  else
+                    PickerField<Object?>(
+                      label: 'Item',
+                      value: rows.any((row) => row['product'] == _product) ? _product : null,
+                      entries: _balanceEntries(rows, 'on the books'),
+                      search: (query) async => _balanceEntries(
+                        await _balances(
+                          ApiScope.of(context),
+                          query: query,
+                          unit: _unit.isEmpty ? 'store' : _unit,
+                        ),
+                        'on the books',
+                      ),
+                      onSelected: (value) => setState(() => _product = value),
                     ),
-                    onSelected: (value) => setState(() => _product = value),
-                  ),
                   const SizedBox(height: 12),
                   TextField(
                     controller: _qty,

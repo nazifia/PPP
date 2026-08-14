@@ -98,6 +98,12 @@ class Api extends ChangeNotifier {
   bool get isAdmin => user?['role'] == 'ADMIN';
   bool get isSuperuser => user?['is_superuser'] == true;
 
+  /// The unit this account works on, where the hospital is divided that far.
+  /// It is what says whose shelf this person may hand stock off, so a transfer
+  /// between two units offers its buttons on the strength of it. Null for a
+  /// supplier, an administrator, and anyone nobody has placed yet.
+  int? get unitId => user?['unit'] as int?;
+
   /// A superuser reading across tenants acts on either side of any row it
   /// opens, because the server takes the tenant from the row itself. Creating a
   /// row from nothing still needs a tenant, so `isHospital` and `isSupplier`
