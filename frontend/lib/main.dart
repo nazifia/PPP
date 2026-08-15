@@ -9,6 +9,7 @@ import 'screens/deliveries.dart';
 import 'screens/login.dart';
 import 'screens/more.dart';
 import 'screens/requests.dart';
+import 'screens/transfers.dart';
 import 'ui.dart';
 
 Future<void> main() async {
@@ -357,6 +358,23 @@ class _HomeShellState extends State<HomeShell> {
     final wide = width >= 720;
     final extended = width >= 1200;
 
+    // A ListTile would assert under the rail: it gives its trailing unbounded
+    // width. Buttons shrink-wrap, and lose their label when the rail is narrow.
+    Widget railButton(IconData icon, String label, VoidCallback onPressed, {Color? color}) =>
+        extended
+            ? TextButton.icon(
+                icon: Icon(icon),
+                label: Text(label),
+                style: TextButton.styleFrom(foregroundColor: color),
+                onPressed: onPressed,
+              )
+            : IconButton(
+                icon: Icon(icon),
+                color: color,
+                tooltip: label,
+                onPressed: onPressed,
+              );
+
     return Scaffold(
       // Content runs under the bottom bar, which is what a translucent one is
       // for: something moving behind the glass. Scaffold pays for it by adding
@@ -386,26 +404,34 @@ class _HomeShellState extends State<HomeShell> {
                                 ),
                             ],
                             // The rail has no "More" overflow the way the bottom bar
-                            // does, so sign out gets its own spot under the tabs.
+                            // does, so what lives behind More on a phone gets its
+                            // own spot under the tabs here.
                             trailing: Padding(
                               padding: const EdgeInsets.only(top: 8),
-                              // A ListTile would assert here: the rail gives its
-                              // trailing unbounded width. Buttons shrink-wrap.
-                              child: extended
-                                  ? TextButton.icon(
-                                      icon: const Icon(Icons.logout),
-                                      label: const Text('Sign out'),
-                                      style: TextButton.styleFrom(
-                                        foregroundColor: Theme.of(context).colorScheme.error,
+                              child: Column(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  // Only a hospital moves stock between its own
+                                  // units, so only a hospital is offered the screen.
+                                  if (api.canActAsHospital)
+                                    railButton(
+                                      Icons.swap_horiz,
+                                      'Unit transfers',
+                                      () => Navigator.push(
+                                        context,
+                                        MaterialPageRoute<void>(
+                                          builder: (_) => const TransfersScreen(),
+                                        ),
                                       ),
-                                      onPressed: () => signOutFlow(context, api),
-                                    )
-                                  : IconButton(
-                                      icon: const Icon(Icons.logout),
-                                      color: Theme.of(context).colorScheme.error,
-                                      tooltip: 'Sign out',
-                                      onPressed: () => signOutFlow(context, api),
                                     ),
+                                  railButton(
+                                    Icons.logout,
+                                    'Sign out',
+                                    () => signOutFlow(context, api),
+                                    color: Theme.of(context).colorScheme.error,
+                                  ),
+                                ],
+                              ),
                             ),
                           ),
                         ),
