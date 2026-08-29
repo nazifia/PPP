@@ -10,6 +10,7 @@ For the full list of settings and their values, see
 https://docs.djangoproject.com/en/6.1/ref/settings/
 """
 import os
+import sys
 from pathlib import Path
 
 from django.core.exceptions import ImproperlyConfigured
@@ -195,6 +196,23 @@ AUTH_PASSWORD_VALIDATORS = [
         'NAME': 'django.contrib.auth.password_validation.NumericPasswordValidator',
     },
 ]
+
+# PBKDF2 is deliberately slow, which is the point everywhere except a test
+# suite that creates a few hundred users and signs them all in: the hashing was
+# most of a thirteen-minute run. Swapped for a fast hasher, and only ever there.
+#
+# Narrow on purpose. It reads argv rather than a settings flag so a local
+# `manage.py test` gets it without anyone remembering to pass one, `runserver`
+# and every other command are untouched, and the PROD guard means a production
+# deployment cannot reach it however it is invoked. The strength rules above
+# are validation, not hashing, so tests still meet the real bar.
+if not PROD and len(sys.argv) > 1 and sys.argv[1] == 'test':
+    PASSWORD_HASHERS = [
+        'django.contrib.auth.hashers.MD5PasswordHasher',
+        # Kept behind it so a hash made the real way — a fixture, a
+        # database copied down from somewhere — still verifies.
+        'django.contrib.auth.hashers.PBKDF2PasswordHasher',
+    ]
 
 
 # Internationalization
