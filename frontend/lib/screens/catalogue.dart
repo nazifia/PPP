@@ -118,7 +118,7 @@ class _CatalogueScreenState extends State<CatalogueScreen> {
           Expanded(
             child: Loader<List<Map<String, dynamic>>>(
               controller: _controller,
-              load: () => api.list('/products/', {
+              load: () => api.listAll('/products/', {
                 'search': _search.text,
                 'supplier': _supplierFilter,
                 if (_availableOnly) 'available': 'true',

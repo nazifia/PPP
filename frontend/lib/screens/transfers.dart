@@ -87,7 +87,7 @@ class _TransfersScreenState extends State<TransfersScreen> {
 
   Future<List<Map<String, dynamic>>> _load() {
     final api = ApiScope.of(context);
-    return api.list('/transfers/', {
+    return api.listAll('/transfers/', {
       'search': _search.text,
       'status': _status,
       if (_mineOnly && api.unitId != null) 'unit': '${api.unitId}',
@@ -140,7 +140,7 @@ class _TransfersScreenState extends State<TransfersScreen> {
             ),
             Bounded(
               child: SizedBox(
-                height: 48,
+                height: 48 * textScale(context),
                 child: ListView(
                   scrollDirection: Axis.horizontal,
                   padding: const EdgeInsets.symmetric(horizontal: 12),

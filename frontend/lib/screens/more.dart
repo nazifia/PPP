@@ -308,7 +308,7 @@ class _CompaniesScreenState extends State<CompaniesScreen> {
           Expanded(
             child: Loader<List<Map<String, dynamic>>>(
               controller: _controller,
-              load: () => api.list('/companies/', {'search': _search.text}),
+              load: () => api.listAll('/companies/', {'search': _search.text}),
               builder: (context, rows, reload) {
                 if (rows.isEmpty) {
                   return const EmptyState('No companies registered yet.', icon: Icons.business);
@@ -774,7 +774,7 @@ class _UsersScreenState extends State<UsersScreen> {
           Expanded(
             child: Loader<List<Map<String, dynamic>>>(
               controller: _controller,
-              load: () => api.list('/users/', {'search': _search.text}),
+              load: () => api.listAll('/users/', {'search': _search.text}),
               builder: (context, rows, reload) {
                 if (rows.isEmpty) {
                   return const EmptyState('No staff accounts found.', icon: Icons.people_outline);
@@ -1030,7 +1030,7 @@ class _InvoicesScreenState extends State<InvoicesScreen> {
           Expanded(
             child: Loader<List<Map<String, dynamic>>>(
               controller: _controller,
-              load: () => api.list('/invoices/', {
+              load: () => api.listAll('/invoices/', {
                 'search': _search.text,
                 if (_overdueOnly) 'overdue': 'true',
               }),
@@ -1588,7 +1588,7 @@ class _CreditsScreenState extends State<CreditsScreen> {
           Expanded(
             child: Loader<List<Map<String, dynamic>>>(
               controller: _controller,
-              load: () => api.list('/credits/', {
+              load: () => api.listAll('/credits/', {
                 'status': _status,
                 if (invoice != null) 'invoice': '${invoice['id']}',
               }),
@@ -1838,7 +1838,7 @@ class _PaymentsScreenState extends State<PaymentsScreen> {
           Expanded(
             child: Loader<List<Map<String, dynamic>>>(
               controller: _controller,
-              load: () => api.list('/payments/', {
+              load: () => api.listAll('/payments/', {
                 'status': _status,
                 if (widget.invoiceId != null) 'invoice': '${widget.invoiceId}',
               }),
@@ -2126,7 +2126,7 @@ class _StockLedgerScreenState extends State<StockLedgerScreen> {
           ),
           Bounded(
             child: SizedBox(
-              height: 48,
+              height: 48 * textScale(context),
               child: ListView(
                 scrollDirection: Axis.horizontal,
                 padding: const EdgeInsets.symmetric(horizontal: 12),
@@ -2639,7 +2639,7 @@ class _ExpiringScreenState extends State<ExpiringScreen> {
         children: [
           Bounded(
             child: SizedBox(
-              height: 48,
+              height: 48 * textScale(context),
               child: ListView(
                 scrollDirection: Axis.horizontal,
                 padding: const EdgeInsets.symmetric(horizontal: 12),
@@ -2663,7 +2663,7 @@ class _ExpiringScreenState extends State<ExpiringScreen> {
           Expanded(
             child: Loader<List<Map<String, dynamic>>>(
               controller: _controller,
-              load: () => api.list('/stock-movements/expiring/', {'days': '$_days'}),
+              load: () => api.listAll('/stock-movements/expiring/', {'days': '$_days'}),
               builder: (context, rows, reload) {
                 if (rows.isEmpty) {
                   return EmptyState(
@@ -2722,7 +2722,7 @@ class AuditScreen extends StatelessWidget {
         ],
       ),
       body: Loader<List<Map<String, dynamic>>>(
-        load: () => api.list('/audit-logs/'),
+        load: () => api.listAll('/audit-logs/'),
         builder: (context, rows, reload) {
           if (rows.isEmpty) return const EmptyState('Nothing recorded yet.');
           return ListView.separated(
@@ -2861,7 +2861,7 @@ class ActAsScreen extends StatelessWidget {
       body: Loader<List<Map<String, dynamic>>>(
         // Not /companies/: that is a hospital's supplier list, so it is gone
         // the moment the superuser steps into a supplier and cannot step out.
-        load: () => api.list('/organizations/'),
+        load: () => api.listAll('/organizations/'),
         builder: (context, rows, reload) => ListView(
           children: [
             tile(

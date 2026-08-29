@@ -159,6 +159,16 @@ class Api extends ChangeNotifier {
     touch();
   }
 
+  /// Drops the idle countdown with the object. Nothing in the app disposes the
+  /// root session, but a test builds one per case and would otherwise leave its
+  /// timers running past the end of the test.
+  @override
+  void dispose() {
+    _stopIdleTimers();
+    idleWarningOn.dispose();
+    super.dispose();
+  }
+
   void _stopIdleTimers() {
     _idleTimer?.cancel();
     _warningTimer?.cancel();
@@ -238,7 +248,18 @@ class Api extends ChangeNotifier {
       unawaited(signOut(idle: true));
     }
     if (response.statusCode == 204 || response.body.isEmpty) return null;
-    final body = jsonDecode(utf8.decode(response.bodyBytes));
+    final dynamic body;
+    try {
+      body = jsonDecode(utf8.decode(response.bodyBytes));
+    } catch (_) {
+      // A refusal comes back as JSON; a crash comes back as a page of HTML,
+      // and 'FormatException: Unexpected character' is not something to put in
+      // front of somebody trying to file a request.
+      throw ApiException(
+        'The server had a problem with this (${response.statusCode}).',
+        response.statusCode,
+      );
+    }
     if (response.statusCode >= 400) {
       throw ApiException(_readError(body), response.statusCode);
     }
@@ -319,6 +340,31 @@ class Api extends ChangeNotifier {
   /// cursor. Enough for a list short enough to read in one screenful.
   Future<List<Map<String, dynamic>>> list(String path, [Map<String, dynamic>? query]) async =>
       (await listPage(path, query)).$1;
+
+  /// Every row a list has, not just the first page.
+  ///
+  /// [list] drops the page cursor, so a screen built on it shows 25 rows and
+  /// gives no sign the 26th exists. This follows the cursor instead, which is
+  /// what a browsable list — requests, invoices, users — needs to be honest.
+  ///
+  /// ponytail: pages eagerly up to [maxPages]; swap for the stock ledger's
+  /// load-as-you-scroll if a list ever grows past a few hundred rows.
+  Future<List<Map<String, dynamic>>> listAll(
+    String path, [
+    Map<String, dynamic>? query,
+    int maxPages = 10,
+  ]) async {
+    final rows = <Map<String, dynamic>>[];
+    for (var page = 1; page <= maxPages; page++) {
+      final (batch, hasNext) = await listPage(path, {
+        ...?query,
+        if (page > 1) 'page': '$page',
+      });
+      rows.addAll(batch);
+      if (!hasNext) break;
+    }
+    return rows;
+  }
 
   /// One page of rows, plus whether the server has another after it. For a list
   /// that outgrows a single page, such as the stock ledger.

@@ -159,7 +159,7 @@ class _RequestsScreenState extends State<RequestsScreen> {
             if (!widget.draftsOnly)
               Bounded(
                 child: SizedBox(
-                  height: 48,
+                  height: 48 * textScale(context),
                   child: ListView(
                     scrollDirection: Axis.horizontal,
                     padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
@@ -209,7 +209,7 @@ class _RequestsScreenState extends State<RequestsScreen> {
               child: Loader<List<Map<String, dynamic>>>(
                 controller: _controller,
                 // A department covers its own units, so picking one is enough.
-                load: () => api.list('/requisitions/', {
+                load: () => api.listAll('/requisitions/', {
                   'status': _status,
                   'search': _search.text,
                   'month': widget.month ?? '',
@@ -535,17 +535,15 @@ class _RequestDetailScreenState extends State<RequestDetailScreen> {
                                           mainAxisSize: MainAxisSize.min,
                                           children: [
                                             IconButton(
+                                              tooltip: 'Change quantity',
                                               icon: const Icon(Icons.edit, size: 18),
                                               onPressed: () => _editLine(context, line, reload),
                                             ),
                                             IconButton(
+                                              tooltip: 'Remove line',
                                               icon: const Icon(Icons.close, size: 18),
-                                              onPressed: () async {
-                                                await api.delete(
-                                                  '/requisition-lines/${line['id']}/',
-                                                );
-                                                reload();
-                                              },
+                                              onPressed: () =>
+                                                  _removeLine(context, line, reload),
                                             ),
                                           ],
                                         )
@@ -817,6 +815,35 @@ class _RequestDetailScreenState extends State<RequestDetailScreen> {
     }
     if (buttons.isEmpty) return const SizedBox.shrink();
     return Wrap(spacing: 10, runSpacing: 10, children: buttons);
+  }
+
+  /// Takes a line off a draft. No confirmation: one line off a wishlist is a
+  /// small thing to undo and a large thing to be asked about every time, so
+  /// the snack bar carries the way back instead.
+  Future<void> _removeLine(
+    BuildContext context,
+    Map<String, dynamic> line,
+    VoidCallback reload,
+  ) async {
+    final api = ApiScope.of(context);
+    try {
+      await api.delete('/requisition-lines/${line['id']}/');
+    } catch (error) {
+      if (context.mounted) showError(context, error);
+      return;
+    }
+    reload();
+    if (!context.mounted) return;
+    showUndo(context, 'Removed ${line['product_name']}.', () async {
+      // A fresh row rather than the old one: the server hands out the id, and
+      // what the line said is all that has to come back.
+      await api.post('/requisition-lines/', {
+        'requisition': widget.requisitionId,
+        'product': line['product'],
+        'qty_requested': qty(line['qty_requested']),
+      });
+      reload();
+    });
   }
 
   Future<void> _editLine(

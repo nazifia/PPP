@@ -32,7 +32,16 @@ class _DashboardScreenState extends State<DashboardScreen> {
       appBar: AppBar(
         title: Text(api.organization?['name'] ?? 'Dashboard'),
         actions: [
-          IconButton(icon: const Icon(Icons.refresh), onPressed: () => api.refreshProfile()),
+          IconButton(
+            tooltip: 'Refresh',
+            icon: const Icon(Icons.refresh),
+            onPressed: () {
+              // The profile behind the title and the figures below it are two
+              // fetches; the button says refresh, so it does both.
+              api.refreshProfile();
+              _controller.reload();
+            },
+          ),
         ],
       ),
       body: Loader<Map<String, dynamic>>(
@@ -49,64 +58,84 @@ class _DashboardScreenState extends State<DashboardScreen> {
             // Explicit padding, so the bar's inset has to be added by hand.
             padding: listInset(context, const EdgeInsets.all(12)),
             children: [
-              Wrap(
-                spacing: 10,
-                runSpacing: 10,
-                children: [
-                  _Stat(
-                    label: api.isSupplier ? 'Awaiting your decision' : 'Awaiting verification',
-                    value: '${data['awaiting_action']}',
-                    seed: Colors.orange,
-                    icon: Icons.pending_actions,
-                  ),
-                  _Stat(
-                    label: 'Requests total',
-                    value: '${data['requests_total']}',
-                    seed: Colors.blue,
-                    icon: Icons.assignment,
-                  ),
-                  _Stat(
-                    label: 'In transit',
-                    value: '${data['deliveries_in_transit']}',
-                    seed: Colors.indigo,
-                    icon: Icons.local_shipping,
-                  ),
-                  _Stat(
-                    label: api.isSupplier ? 'Receivable' : 'Payable',
-                    value: amount(data['invoices_outstanding']),
-                    seed: Colors.red,
-                    icon: Icons.receipt_long,
-                  ),
-                  if ((data['invoices_overdue'] as int? ?? 0) > 0)
-                    _Stat(
-                      label: '${data['invoices_overdue']} overdue',
-                      value: amount(data['invoices_overdue_amount']),
-                      seed: Colors.deepOrange,
-                      icon: Icons.event_busy,
-                    ),
-                  if ((data['payments_pending'] as int? ?? 0) > 0)
-                    _Stat(
-                      label: api.isSupplier
-                          ? 'Payments to confirm'
-                          : 'Payments awaiting confirmation',
-                      value: '${data['payments_pending']}',
-                      seed: Colors.amber,
-                      icon: Icons.payments_outlined,
-                    ),
-                  _Stat(
-                    label: api.isSupplier ? 'Hospitals' : 'Companies',
-                    value: '${data['partners']}',
-                    seed: Colors.teal,
-                    icon: Icons.handshake,
-                  ),
-                  if (data['catalogue_items'] != null)
-                    _Stat(
-                      label: 'Catalogue items',
-                      value: '${data['catalogue_items']}',
-                      seed: Colors.purple,
-                      icon: Icons.medication,
-                    ),
-                ],
+              // As many tiles per row as fit at a readable size, and never
+              // fewer than two: one column wastes a phone, and the fixed 168
+              // this used to be left a ragged tail of dead space on a monitor.
+              LayoutBuilder(
+                builder: (context, constraints) {
+                  const spacing = 10.0;
+                  final columns = (constraints.maxWidth / 190).floor().clamp(2, 5).toInt();
+                  final tile = (constraints.maxWidth - spacing * (columns - 1)) / columns;
+                  return Wrap(
+                    spacing: spacing,
+                    runSpacing: spacing,
+                    children: [
+                      _Stat(
+                        width: tile,
+                        label: api.isSupplier
+                            ? 'Awaiting your decision'
+                            : 'Awaiting verification',
+                        value: '${data['awaiting_action']}',
+                        seed: Colors.orange,
+                        icon: Icons.pending_actions,
+                      ),
+                      _Stat(
+                        width: tile,
+                        label: 'Requests total',
+                        value: '${data['requests_total']}',
+                        seed: Colors.blue,
+                        icon: Icons.assignment,
+                      ),
+                      _Stat(
+                        width: tile,
+                        label: 'In transit',
+                        value: '${data['deliveries_in_transit']}',
+                        seed: Colors.indigo,
+                        icon: Icons.local_shipping,
+                      ),
+                      _Stat(
+                        width: tile,
+                        label: api.isSupplier ? 'Receivable' : 'Payable',
+                        value: amount(data['invoices_outstanding']),
+                        seed: Colors.red,
+                        icon: Icons.receipt_long,
+                      ),
+                      if ((data['invoices_overdue'] as int? ?? 0) > 0)
+                        _Stat(
+                          width: tile,
+                          label: '${data['invoices_overdue']} overdue',
+                          value: amount(data['invoices_overdue_amount']),
+                          seed: Colors.deepOrange,
+                          icon: Icons.event_busy,
+                        ),
+                      if ((data['payments_pending'] as int? ?? 0) > 0)
+                        _Stat(
+                          width: tile,
+                          label: api.isSupplier
+                              ? 'Payments to confirm'
+                              : 'Payments awaiting confirmation',
+                          value: '${data['payments_pending']}',
+                          seed: Colors.amber,
+                          icon: Icons.payments_outlined,
+                        ),
+                      _Stat(
+                        width: tile,
+                        label: api.isSupplier ? 'Hospitals' : 'Companies',
+                        value: '${data['partners']}',
+                        seed: Colors.teal,
+                        icon: Icons.handshake,
+                      ),
+                      if (data['catalogue_items'] != null)
+                        _Stat(
+                          width: tile,
+                          label: 'Catalogue items',
+                          value: '${data['catalogue_items']}',
+                          seed: Colors.purple,
+                          icon: Icons.medication,
+                        ),
+                    ],
+                  );
+                },
               ),
               const SizedBox(height: 16),
               if (byStatus.isNotEmpty) ...[
@@ -243,7 +272,17 @@ class _DashboardScreenState extends State<DashboardScreen> {
 }
 
 class _Stat extends StatelessWidget {
-  const _Stat({required this.label, required this.value, required this.seed, required this.icon});
+  const _Stat({
+    required this.width,
+    required this.label,
+    required this.value,
+    required this.seed,
+    required this.icon,
+  });
+
+  /// Decided by the row, which is the only thing that knows how many tiles
+  /// have to share the space.
+  final double width;
 
   final String label;
   final String value;
@@ -254,33 +293,36 @@ class _Stat extends StatelessWidget {
   Widget build(BuildContext context) {
     final scheme = tonalScheme(context, seed);
     final textTheme = Theme.of(context).textTheme;
-    // Two per row even on the narrowest phone, where a 168 card would leave a
-    // column of dead space. 34 = the list padding plus the Wrap spacing.
-    final screenWidth = MediaQuery.sizeOf(context).width;
     // Glass rather than a filled card: this row is the top of the screen and
     // stays there, so it is worth the blur that the list rows below are not.
     // The tint keeps each tile's tonal colour; only the material changes.
-    return Glass(
-      width: screenWidth < 380 ? (screenWidth - 34) / 2 : 168,
-      tint: scheme.primaryContainer,
-      // Opaque enough that the numbers stay readable over a moving backdrop.
-      opacity: 0.82,
-      padding: const EdgeInsets.all(12),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Icon(icon, color: scheme.onPrimaryContainer, size: 20),
-          const SizedBox(height: 6),
-          FittedBox(
-            fit: BoxFit.scaleDown,
-            alignment: Alignment.centerLeft,
-            child: Text(
-              value,
-              style: textTheme.headlineSmall?.copyWith(color: scheme.onPrimaryContainer),
+    // One reading, not two: a screen reader announcing '4' and then 'Awaiting
+    // your decision' as separate nodes leaves the number floating.
+    return Semantics(
+      label: '$label: $value',
+      excludeSemantics: true,
+      child: Glass(
+        width: width,
+        tint: scheme.primaryContainer,
+        // Opaque enough that the numbers stay readable over a moving backdrop.
+        opacity: 0.82,
+        padding: const EdgeInsets.all(12),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Icon(icon, color: scheme.onPrimaryContainer, size: 20),
+            const SizedBox(height: 6),
+            FittedBox(
+              fit: BoxFit.scaleDown,
+              alignment: Alignment.centerLeft,
+              child: Text(
+                value,
+                style: textTheme.headlineSmall?.copyWith(color: scheme.onPrimaryContainer),
+              ),
             ),
-          ),
-          Text(label, style: textTheme.labelMedium?.copyWith(color: scheme.onPrimaryContainer)),
-        ],
+            Text(label, style: textTheme.labelMedium?.copyWith(color: scheme.onPrimaryContainer)),
+          ],
+        ),
       ),
     );
   }
@@ -302,6 +344,7 @@ class _StatusDonut extends StatelessWidget {
           label: entry.key.replaceAll('_', ' '),
           value: qty(entry.value),
           color: statusScheme(context, entry.key).primary,
+          icon: statusIcon(entry.key),
         ),
     ]..sort((a, b) => b.value.compareTo(a.value));
     final total = slices.fold<double>(0, (sum, slice) => sum + slice.value);
@@ -309,18 +352,25 @@ class _StatusDonut extends StatelessWidget {
     return Row(
       crossAxisAlignment: CrossAxisAlignment.center,
       children: [
-        SizedBox(
-          width: 120,
-          height: 120,
-          child: CustomPaint(
-            painter: _DonutPainter(slices: slices, total: total),
-            child: Center(
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Text('${total.round()}', style: textTheme.headlineSmall),
-                  Text('total', style: textTheme.labelSmall),
-                ],
+        // The ring paints on a canvas, which carries no semantics of its own.
+        // The legend beside it already reads the counts out, so this only has
+        // to name what the picture is.
+        Semantics(
+          label: 'Requests by status, ${total.round()} in total',
+          excludeSemantics: true,
+          child: SizedBox(
+            width: 120,
+            height: 120,
+            child: CustomPaint(
+              painter: _DonutPainter(slices: slices, total: total),
+              child: Center(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Text('${total.round()}', style: textTheme.headlineSmall),
+                    Text('total', style: textTheme.labelSmall),
+                  ],
+                ),
               ),
             ),
           ),
@@ -335,11 +385,10 @@ class _StatusDonut extends StatelessWidget {
                   padding: const EdgeInsets.symmetric(vertical: 3),
                   child: Row(
                     children: [
-                      Container(
-                        width: 10,
-                        height: 10,
-                        decoration: BoxDecoration(color: slice.color, shape: BoxShape.circle),
-                      ),
+                      // The status's own icon rather than a plain dot: the
+                      // ring's slices are told apart by hue, which approved
+                      // green and rejected red do not survive.
+                      Icon(slice.icon, size: 14, color: slice.color),
                       const SizedBox(width: 8),
                       Expanded(
                         child: Text(
@@ -366,7 +415,7 @@ class _StatusDonut extends StatelessWidget {
 class _DonutPainter extends CustomPainter {
   _DonutPainter({required this.slices, required this.total});
 
-  final List<({String label, double value, Color color})> slices;
+  final List<({String label, double value, Color color, IconData icon})> slices;
   final double total;
 
   /// The hairline between two slices, in radians. Dropped on a slice too thin
@@ -413,38 +462,45 @@ class _MonthlyBars extends StatelessWidget {
     final textTheme = Theme.of(context).textTheme;
     final peak = rows.map((row) => qty(row['count'])).reduce(math.max);
     return SizedBox(
-      height: 140,
+      height: 140 * textScale(context),
       child: Row(
         crossAxisAlignment: CrossAxisAlignment.end,
         children: [
           for (final row in rows)
             Expanded(
-              child: InkWell(
-                // An empty month opens an empty list, which is an answer too.
-                onTap: () => onTap('${row['month']}'),
-                child: Column(
-                  mainAxisAlignment: MainAxisAlignment.end,
-                  children: [
-                    Text('${qty(row['count']).round()}', style: textTheme.labelSmall),
-                    const SizedBox(height: 2),
-                    Expanded(
-                      child: FractionallySizedBox(
-                        // The tallest bar fills the plot; an empty month keeps a
-                        // sliver so the column still reads as a bar.
-                        heightFactor: peak > 0 ? math.max(qty(row['count']) / peak, 0.02) : 0.02,
-                        alignment: Alignment.bottomCenter,
-                        widthFactor: 0.55,
-                        child: DecoratedBox(
-                          decoration: BoxDecoration(
-                            color: scheme.primary,
-                            borderRadius: const BorderRadius.vertical(top: Radius.circular(4)),
+              child: Semantics(
+                button: true,
+                label:
+                    '${monthLabel('${row['month']}')}: '
+                    '${qty(row['count']).round()} requests',
+                excludeSemantics: true,
+                child: InkWell(
+                  // An empty month opens an empty list, which is an answer too.
+                  onTap: () => onTap('${row['month']}'),
+                  child: Column(
+                    mainAxisAlignment: MainAxisAlignment.end,
+                    children: [
+                      Text('${qty(row['count']).round()}', style: textTheme.labelSmall),
+                      const SizedBox(height: 2),
+                      Expanded(
+                        child: FractionallySizedBox(
+                          // The tallest bar fills the plot; an empty month keeps a
+                          // sliver so the column still reads as a bar.
+                          heightFactor: peak > 0 ? math.max(qty(row['count']) / peak, 0.02) : 0.02,
+                          alignment: Alignment.bottomCenter,
+                          widthFactor: 0.55,
+                          child: DecoratedBox(
+                            decoration: BoxDecoration(
+                              color: scheme.primary,
+                              borderRadius: const BorderRadius.vertical(top: Radius.circular(4)),
+                            ),
                           ),
                         ),
                       ),
-                    ),
-                    const SizedBox(height: 4),
-                    Text(monthLabel('${row['month']}', short: true), style: textTheme.labelSmall),
-                  ],
+                      const SizedBox(height: 4),
+                      Text(monthLabel('${row['month']}', short: true), style: textTheme.labelSmall),
+                    ],
+                  ),
                 ),
               ),
             ),
@@ -474,43 +530,48 @@ class _DepartmentBar extends StatelessWidget {
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
     final textTheme = Theme.of(context).textTheme;
-    return InkWell(
-      onTap: onTap,
-      child: Padding(
-        padding: const EdgeInsets.fromLTRB(16, 8, 16, 8),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Row(
-              children: [
-                Expanded(child: Text(name, overflow: TextOverflow.ellipsis)),
-                const SizedBox(width: 8),
-                Text(amount(total), style: textTheme.titleSmall),
-              ],
-            ),
-            const SizedBox(height: 6),
-            ClipRRect(
-              borderRadius: BorderRadius.circular(4),
-              child: Container(
-                height: 8,
-                color: scheme.surfaceContainerHighest,
-                child: FractionallySizedBox(
-                  alignment: Alignment.centerLeft,
-                  widthFactor: scale > 0 ? (total / scale).clamp(0.0, 1.0) : 0,
-                  child: Container(
-                    color: scheme.primaryContainer,
-                    child: FractionallySizedBox(
-                      alignment: Alignment.centerLeft,
-                      widthFactor: total > 0 ? (paid / total).clamp(0.0, 1.0) : 0,
-                      child: Container(color: scheme.primary),
+    return Semantics(
+      button: true,
+      label: '$name: ${amount(total)} invoiced, ${amount(paid)} paid',
+      excludeSemantics: true,
+      child: InkWell(
+        onTap: onTap,
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(16, 8, 16, 8),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: [
+                  Expanded(child: Text(name, overflow: TextOverflow.ellipsis)),
+                  const SizedBox(width: 8),
+                  Text(amount(total), style: textTheme.titleSmall),
+                ],
+              ),
+              const SizedBox(height: 6),
+              ClipRRect(
+                borderRadius: BorderRadius.circular(4),
+                child: Container(
+                  height: 8,
+                  color: scheme.surfaceContainerHighest,
+                  child: FractionallySizedBox(
+                    alignment: Alignment.centerLeft,
+                    widthFactor: scale > 0 ? (total / scale).clamp(0.0, 1.0) : 0,
+                    child: Container(
+                      color: scheme.primaryContainer,
+                      child: FractionallySizedBox(
+                        alignment: Alignment.centerLeft,
+                        widthFactor: total > 0 ? (paid / total).clamp(0.0, 1.0) : 0,
+                        child: Container(color: scheme.primary),
+                      ),
                     ),
                   ),
                 ),
               ),
-            ),
-            const SizedBox(height: 4),
-            Text('${amount(paid)} paid', style: textTheme.bodySmall),
-          ],
+              const SizedBox(height: 4),
+              Text('${amount(paid)} paid', style: textTheme.bodySmall),
+            ],
+          ),
         ),
       ),
     );

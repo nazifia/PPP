@@ -51,6 +51,18 @@ TextInputType qtyKeyboard({bool signed = false}) =>
 
 const badQtyMessage = 'Quantities go in half units: 0.5, 1, 1.5 and so on.';
 
+/// How much bigger the user has asked text to be, for the few boxes given a
+/// fixed height in pixels. Without it, a row sized for one line of text at the
+/// default size clips its own labels the moment somebody turns fonts up.
+///
+/// Capped at [max]: a chip rail that grew with no ceiling would take half the
+/// screen at the largest accessibility setting.
+double textScale(BuildContext context, {double max = 1.6}) {
+  final factor = MediaQuery.textScalerOf(context).scale(1);
+  if (factor < 1) return 1;
+  return factor > max ? max : factor;
+}
+
 /// Seeds for the tonal palettes below. Never painted directly: a raw material
 /// colour is unreadable in one theme or the other, so it is run through
 /// [statusScheme] first.
@@ -82,6 +94,39 @@ const statusColors = <String, Color>{
   'AVL': Colors.green,
   'RV': Colors.blue,
 };
+
+/// The same statuses as a shape, so the two that matter most — approved green
+/// and rejected red — are not told apart by hue alone. Every chip carries one,
+/// and the donut legend uses it in place of a plain colour swatch.
+const statusIcons = <String, IconData>{
+  'DRAFT': Icons.edit_note,
+  'SUBMITTED': Icons.outbox_outlined,
+  'APPROVED': Icons.check_circle_outline,
+  'PARTIALLY_APPROVED': Icons.incomplete_circle,
+  'REJECTED': Icons.cancel_outlined,
+  'DISPATCHED': Icons.local_shipping_outlined,
+  'DELIVERED': Icons.inventory_2_outlined,
+  'CLOSED': Icons.lock_outline,
+  'CANCELLED': Icons.block,
+  'IN_TRANSIT': Icons.local_shipping_outlined,
+  'VERIFIED': Icons.verified_outlined,
+  'RETURNED': Icons.undo,
+  'UNPAID': Icons.money_off,
+  'OVERDUE': Icons.event_busy_outlined,
+  'PART_PAID': Icons.incomplete_circle,
+  'PAID': Icons.paid_outlined,
+  'PENDING': Icons.schedule,
+  'CONFIRMED': Icons.check_circle_outline,
+  'REQUESTED': Icons.pan_tool_alt_outlined,
+  'ISSUED': Icons.outbound_outlined,
+  'RECEIVED': Icons.check_circle_outline,
+  'WITHDRAWN': Icons.remove_circle_outline,
+  'PARTIAL': Icons.incomplete_circle,
+  'AVL': Icons.inventory_2_outlined,
+  'RV': Icons.production_quantity_limits,
+};
+
+IconData statusIcon(String status) => statusIcons[status] ?? Icons.circle_outlined;
 
 final _schemeCache = <(Color, Brightness), ColorScheme>{};
 
@@ -263,17 +308,24 @@ class StatusChip extends StatelessWidget {
   Widget build(BuildContext context) {
     final scheme = statusScheme(context, status);
     return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+      padding: const EdgeInsets.fromLTRB(6, 4, 8, 4),
       decoration: BoxDecoration(
         color: scheme.primaryContainer,
         borderRadius: BorderRadius.circular(8),
       ),
-      child: Text(
-        status.replaceAll('_', ' '),
-        style: Theme.of(context).textTheme.labelSmall?.copyWith(
-          color: scheme.onPrimaryContainer,
-          fontWeight: FontWeight.w600,
-        ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(statusIcon(status), size: 14, color: scheme.onPrimaryContainer),
+          const SizedBox(width: 4),
+          Text(
+            status.replaceAll('_', ' '),
+            style: Theme.of(context).textTheme.labelSmall?.copyWith(
+              color: scheme.onPrimaryContainer,
+              fontWeight: FontWeight.w600,
+            ),
+          ),
+        ],
       ),
     );
   }
@@ -320,6 +372,31 @@ double dialogWidth(BuildContext context, [double preferred = 460]) {
 
 void showDone(BuildContext context, String message) {
   ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(message)));
+}
+
+/// Reports something done and offers it back for as long as the snack bar is
+/// up. For a small reversible action taken often — removing one line off a
+/// draft — where a confirmation dialog every time would cost more than the
+/// mistake does.
+void showUndo(BuildContext context, String message, Future<void> Function() undo) {
+  final messenger = ScaffoldMessenger.of(context);
+  messenger.showSnackBar(
+    SnackBar(
+      content: Text(message),
+      duration: const Duration(seconds: 6),
+      action: SnackBarAction(
+        label: 'Undo',
+        onPressed: () async {
+          try {
+            await undo();
+          } catch (error) {
+            // The snack bar is gone by now, so this reports itself.
+            messenger.showSnackBar(SnackBar(content: Text('Could not undo: $error')));
+          }
+        },
+      ),
+    ),
+  );
 }
 
 /// A dropdown that can be typed into: the list filters on any part of a
@@ -565,6 +642,12 @@ class LoaderController extends ChangeNotifier {
 class _LoaderState<T> extends State<Loader<T>> {
   late Future<T> _future;
 
+  /// What the last successful load returned. A refetch keeps it on screen
+  /// under a progress bar rather than replacing the list with a spinner: a
+  /// search keystroke or a filter tap would otherwise blank the rows and throw
+  /// away where the user had scrolled to.
+  T? _last;
+
   @override
   void initState() {
     super.initState();
@@ -588,13 +671,36 @@ class _LoaderState<T> extends State<Loader<T>> {
     widget.onReload?.call();
   }
 
+  /// The loaded content, with a progress bar over it while [loading] — a
+  /// refetch showing what it already has until the new rows land.
+  Widget _content(BuildContext context, T data, {required bool loading}) {
+    final body = RefreshIndicator(
+      onRefresh: () async => _reload(),
+      child: Bounded(child: widget.builder(context, data, _reload)),
+    );
+    if (!loading) return body;
+    return Stack(
+      children: [
+        body,
+        const Positioned(
+          top: 0,
+          left: 0,
+          right: 0,
+          child: LinearProgressIndicator(minHeight: 2),
+        ),
+      ],
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return FutureBuilder<T>(
       future: _future,
       builder: (context, snapshot) {
         if (snapshot.connectionState != ConnectionState.done) {
-          return const Center(child: CircularProgressIndicator());
+          // Nothing has ever loaded here, so there is nothing to keep up.
+          if (_last == null) return const Center(child: CircularProgressIndicator());
+          return _content(context, _last as T, loading: true);
         }
         if (snapshot.hasError) {
           return Center(
@@ -617,10 +723,10 @@ class _LoaderState<T> extends State<Loader<T>> {
             ),
           );
         }
-        return RefreshIndicator(
-          onRefresh: () async => _reload(),
-          child: Bounded(child: widget.builder(context, snapshot.data as T, _reload)),
-        );
+        // Cached during the build that already renders it, not in setState:
+        // this only remembers what is on screen, so it changes nothing.
+        _last = snapshot.data;
+        return _content(context, snapshot.data as T, loading: false);
       },
     );
   }
@@ -697,7 +803,10 @@ class WideTable extends StatelessWidget {
                 children: [
                   // An unnamed column (an actions column) gets the full width.
                   if (cellIndex < columns.length && columns[cellIndex].isNotEmpty)
-                    SizedBox(width: 92, child: Text(columns[cellIndex], style: labelStyle)),
+                    SizedBox(
+                      width: 92 * textScale(context),
+                      child: Text(columns[cellIndex], style: labelStyle),
+                    ),
                   Expanded(
                     child: Align(alignment: Alignment.centerLeft, child: cell.child),
                   ),

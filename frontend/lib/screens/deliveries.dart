@@ -48,7 +48,7 @@ class _DeliveriesScreenState extends State<DeliveriesScreen> {
             Expanded(
               child: Loader<List<Map<String, dynamic>>>(
                 controller: _controller,
-                load: () => api.list('/deliveries/', {'search': _search.text}),
+                load: () => api.listAll('/deliveries/', {'search': _search.text}),
                 builder: (context, rows, reload) {
                   if (rows.isEmpty) {
                     return const EmptyState(

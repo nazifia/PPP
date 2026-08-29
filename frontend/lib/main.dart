@@ -254,7 +254,26 @@ class _Gate extends StatelessWidget {
   Widget build(BuildContext context) {
     final api = ApiScope.of(context);
     if (!api.ready) {
-      return const Scaffold(body: Center(child: CircularProgressIndicator()));
+      // The same mark the sign-in screen opens with, so the first frame of a
+      // cold start is the app rather than an anonymous spinner.
+      return Scaffold(
+        body: Center(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(
+                Icons.local_hospital,
+                size: 56,
+                color: Theme.of(context).colorScheme.primary,
+              ),
+              const SizedBox(height: 8),
+              Text('PPP Supply', style: Theme.of(context).textTheme.headlineMedium),
+              const SizedBox(height: 24),
+              const CircularProgressIndicator(),
+            ],
+          ),
+        ),
+      );
     }
     return api.signedIn ? const HomeShell() : const LoginScreen();
   }
