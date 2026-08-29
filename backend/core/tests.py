@@ -1871,6 +1871,7 @@ class SupplyFlowTests(APITestCase):
             self.assertIn(marker, body)
             self.assertIn(self.hospital.name, body)
             self.assertIn(self.supplier.name, body)
+            self.assertIn('Powered by: Nazz Tech 08032194090', body)
         self.assertIn('7,200.00', self.client.get(links['INVOICE']).content.decode())
         self.assertIn(requisition.reference, self.client.get(links['DELIVERY NOTE']).content.decode())
 

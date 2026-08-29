@@ -46,6 +46,7 @@
   .signatures { margin-top: 30px; }
   .signatures td { border-top: 1px solid #111; padding-top: 3px; padding-right: 24px; }
   .foot td { border-top: 1px solid #ddd; padding-top: 4px; font-size: 7.5pt; color: #666; }
+  .foot td.powered { border-top: none; text-align: center; }
 
 {% if pdf %}
   /* xhtml2pdf: a named content frame plus a static footer frame, which is what
@@ -57,7 +58,7 @@
     @frame content_frame { left: 1.4cm; top: 1.4cm; width: 18.2cm; height: 25.6cm; }
     @frame footer_frame {
       -pdf-frame-content: page-footer;
-      left: 1.4cm; top: 27.4cm; width: 18.2cm; height: 1cm;
+      left: 1.4cm; top: 27.1cm; width: 18.2cm; height: 1.2cm;
     }
   }
   #page-footer { font-size: 7.5pt; color: #666; }
@@ -178,12 +179,16 @@ and ignores the attribute.
     <td>Printed by {{ printed_by }} on {{ printed_at }}</td>
     <td class="right">{{ title|title }} {{ reference }}</td>
   </tr>
+  <tr>
+    <td colspan="2" class="powered">Powered by: Nazz Tech 08032194090</td>
+  </tr>
 </table>
 
 {% if pdf %}
 <div id="page-footer">
   {{ title|title }} {{ reference }} · printed by {{ printed_by }} on {{ printed_at }}
   · page <pdf:pagenumber /> of <pdf:pagecount />
+  <br />Powered by: Nazz Tech 08032194090
 </div>
 {% else %}
 <script>
