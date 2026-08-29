@@ -127,6 +127,21 @@ class SupplyFlowTests(APITestCase):
         self.hospital.refresh_from_db()
         self.assertEqual(self.hospital.idle_timeout_minutes, 10)
 
+    def test_an_administrator_cannot_suspend_its_own_organisation(self):
+        """Suspension cuts every session and refuses every login, so a tenant
+        that could clear the flag on itself would lock itself out for good:
+        nobody left to sign in and put it back. It is the platform's switch.
+        """
+        self.login('08011111111')
+        response = self.client.patch(
+            '/api/organization/', {'is_active': False, 'address': '1 Ward Road'},
+            format='json',
+        )
+        self.assertEqual(response.status_code, 200, response.data)
+        self.hospital.refresh_from_db()
+        self.assertTrue(self.hospital.is_active)
+        self.assertEqual(self.hospital.address, '1 Ward Road')
+
     def test_an_idle_token_expires_on_the_organisation_policy(self):
         self.hospital.idle_timeout_minutes = 10
         self.hospital.save(update_fields=['idle_timeout_minutes'])
@@ -1461,14 +1476,89 @@ class SupplyFlowTests(APITestCase):
             403,
         )
 
-        # Even an administrator cannot close the company's own account from here.
+        # Nor can an administrator, because this company runs its own account:
+        # neither its details nor the account itself are the hospital's to edit.
         self.login('08011111111')
         response = self.client.patch(
-            f'/api/companies/{self.supplier.id}/', {'is_active': False}, format='json',
+            f'/api/companies/{self.supplier.id}/',
+            {'name': 'Hijacked', 'phone': '08099999999', 'is_active': False},
+            format='json',
         )
-        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(response.status_code, 403, response.data)
         self.supplier.refresh_from_db()
+        self.assertEqual(self.supplier.name, 'Valour Pharmaceuticals')
+        self.assertEqual(self.supplier.phone, '08000000002')
         self.assertTrue(self.supplier.is_active)
+
+    def test_a_hospital_edits_the_company_it_registered_until_the_company_signs_in(self):
+        """And a hospital that merely linked to a live company edits nothing."""
+        self.login('08011111111')
+        registered = self.client.post('/api/companies/', {
+            'name': 'DCL Lab Products', 'phone': '08044444444',
+            'contact_full_name': 'DCL Contact', 'contact_phone': '08044444445',
+            'password': 'Sup3rSecret!',
+        }, format='json')
+        self.assertEqual(registered.status_code, 201, registered.data)
+        company_id = registered.data['id']
+
+        # Nobody has signed in for the company yet, so the record is still the
+        # hospital's to correct.
+        fixed = self.client.patch(
+            f'/api/companies/{company_id}/', {'address': '2 Lab Road'}, format='json',
+        )
+        self.assertEqual(fixed.status_code, 200, fixed.data)
+        self.assertEqual(fixed.data['address'], '2 Lab Road')
+
+        # The company signs in and sets its own password. From here it is
+        # nobody else's to edit — not the hospital that registered it...
+        self.client.credentials()
+        token = self.client.post(
+            reverse('login'), {'phone': '08044444445', 'password': 'Sup3rSecret!'},
+            format='json',
+        ).data['token']
+        self.client.credentials(HTTP_AUTHORIZATION='Token ' + token)
+        self.assertEqual(
+            self.client.post(
+                reverse('change-password'),
+                {'current_password': 'Sup3rSecret!', 'new_password': 'Ev3nMoreSecret!'},
+                format='json',
+            ).status_code,
+            200,
+        )
+
+        self.login('08011111111')
+        self.assertEqual(
+            self.client.patch(
+                f'/api/companies/{company_id}/', {'name': 'Hijacked'}, format='json',
+            ).status_code,
+            403,
+        )
+
+        # ...nor a second hospital that reached it by linking on its phone number.
+        other = Organization.objects.create(
+            name='Cottage Hospital', kind=OrgKind.HOSPITAL, phone='08055555555',
+        )
+        User.objects.create_user(
+            phone='08055555556', password='Sup3rSecret!', full_name='Other Admin',
+            organization=other, role=Role.ADMIN,
+        )
+        self.login('08055555556')
+        self.assertEqual(
+            self.client.post(
+                '/api/companies/link/', {'phone': '08044444444'}, format='json',
+            ).status_code,
+            201,
+        )
+        self.assertEqual(
+            self.client.patch(
+                f'/api/companies/{company_id}/',
+                {'name': 'Hijacked', 'phone': '08066666666'}, format='json',
+            ).status_code,
+            403,
+        )
+        company = Organization.objects.get(pk=company_id)
+        self.assertEqual(company.name, 'DCL Lab Products')
+        self.assertEqual(company.phone, '08044444444')
 
     def test_supplier_staff_read_the_catalogue_but_do_not_price_approve_or_release(self):
         User.objects.create_user(
@@ -2018,6 +2108,21 @@ class SupplyFlowTests(APITestCase):
         # before it is opened.
         User.objects.filter(phone='08011111111').update(role=Role.STAFF)
         self.assertEqual(self.client.get(url).status_code, 404)
+
+    def test_a_print_link_dies_with_the_organisation_it_was_made_in(self):
+        """A signed link is a second door into the same rows, so a suspension
+        has to shut it as it shuts the API — however the suspension was made.
+        """
+        invoice = self.raise_invoice(qty=1)
+        self.login('08011111111')
+        url = self.client.get(f'/api/invoices/{invoice.id}/print-link/').data['url']
+        ledger = self.client.get('/api/audit-logs/print-link/').data['url']
+        self.client.credentials()
+        self.assertEqual(self.client.get(url).status_code, 200)
+
+        Organization.objects.filter(pk=self.hospital.pk).update(is_active=False)
+        self.assertEqual(self.client.get(url).status_code, 404)
+        self.assertEqual(self.client.get(ledger).status_code, 404)
 
     def test_the_app_prints_a_pdf_over_the_ordinary_api(self):
         """No link, no browser: the token fetches the PDF and the app prints it."""

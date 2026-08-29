@@ -686,9 +686,15 @@ def document(request, kind, pk=0):
     if (signed_kind, signed_pk) != (kind, str(pk)):
         raise Http404('This print link is for another document.')
 
-    user = User.objects.filter(pk=user_id).first()
+    user = User.objects.select_related('organization').filter(pk=user_id).first()
     if user is None or not user.is_active:
         raise Http404('The account that made this link is gone.')
+    # The signature is the whole of this door's authentication, so it answers
+    # the same question core/auth.py asks of every token: is the organisation
+    # behind this account still trading? A suspension has to shut this link too,
+    # or a tenant cut off at the API goes on printing its rows for ten minutes.
+    if user.organization is not None and not user.organization.is_active:
+        raise Http404('That organisation has been suspended.')
 
     return render_sheet(
         kind, user, pk=pk, filters=dict(parse_qsl(query)),

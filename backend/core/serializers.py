@@ -92,7 +92,12 @@ class OrganizationSerializer(serializers.ModelSerializer):
             'registration_no', 'payment_terms_days', 'idle_timeout_minutes',
             'is_active', 'created_at',
         ]
-        read_only_fields = ['kind', 'created_at']
+        # is_active is the platform's switch, not the tenant's. Suspending an
+        # organisation cuts every session it has open and refuses its logins, so
+        # an administrator clearing it here would lock the whole tenant — itself
+        # included — out of the only door that could put it back. The same
+        # reasoning keeps it read-only on CompanySerializer.
+        read_only_fields = ['kind', 'is_active', 'created_at']
 
     def validate_phone(self, value):
         return unique_org_phone(value, self.instance)

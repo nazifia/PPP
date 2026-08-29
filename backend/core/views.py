@@ -376,6 +376,32 @@ class CompanyViewSet(viewsets.ModelViewSet):
         supplier = serializer.save()
         return Response(CompanySerializer(supplier).data, status=status.HTTP_201_CREATED)
 
+    def perform_update(self, serializer):
+        """Only a company that has not taken over its own account may be edited.
+
+        `create` puts a company on the platform and types its details in on its
+        behalf, so the hospital holding that record has to be able to correct
+        it. `link` does not: it opens a trading line to a company that is
+        already there, running its own account, its own catalogue and its own
+        staff. Without this, knowing a company's phone number was enough to
+        link to it and then rewrite its name and that same phone number —
+        changing what every other hospital sees, and moving the identity `link`
+        resolves companies by.
+
+        A company has taken over when somebody has signed in and set their own
+        password; until then its account is still the one the hospital opened.
+        From that point the company edits itself through /api/organization/.
+        """
+        supplier = serializer.instance
+        if not self.request.user.sees_all_tenants and User.objects.filter(
+            organization=supplier, is_active=True, must_change_password=False,
+        ).exists():
+            raise PermissionDenied(
+                f'{supplier.name} manages its own profile. Ask the company to '
+                f'change it.'
+            )
+        serializer.save()
+
     def perform_destroy(self, instance):
         """Suspend the trading link. The company and its history stay."""
         # A link joins two organisations, so suspending one means saying which
