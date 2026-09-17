@@ -621,7 +621,7 @@ class _AskDialogState extends State<_AskDialog> {
           future: _allUnits!,
           builder: (context, snapshot) {
             if (snapshot.connectionState != ConnectionState.done) {
-              return const SizedBox(height: 80, child: Center(child: CircularProgressIndicator()));
+              return const Spinner(height: 80);
             }
             if (snapshot.hasError) return Text('${snapshot.error}');
             final units = snapshot.data!;

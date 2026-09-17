@@ -46,224 +46,232 @@ class _DashboardScreenState extends State<DashboardScreen> {
       ),
       body: Loader<Map<String, dynamic>>(
         controller: _controller,
-        load: () async =>
-            await api.get('/dashboard/', {'months': _months}) as Map<String, dynamic>,
+        load: () async => await api.get('/dashboard/', {'months': _months}) as Map<String, dynamic>,
         builder: (context, data, reload) {
           final byStatus = (data['requests_by_status'] as Map).cast<String, dynamic>();
           final recent = (data['recent'] as List).cast<Map<String, dynamic>>();
           final lowStock = (data['low_stock'] as List).cast<Map<String, dynamic>>();
           final spend = (data['spend_by_department'] as List? ?? []).cast<Map<String, dynamic>>();
           final monthly = (data['requests_monthly'] as List? ?? []).cast<Map<String, dynamic>>();
-          return ListView(
-            // Explicit padding, so the bar's inset has to be added by hand.
-            padding: listInset(context, const EdgeInsets.all(12)),
-            children: [
-              // As many tiles per row as fit at a readable size, and never
-              // fewer than two: one column wastes a phone, and the fixed 168
-              // this used to be left a ragged tail of dead space on a monitor.
-              LayoutBuilder(
-                builder: (context, constraints) {
-                  const spacing = 10.0;
-                  final columns = (constraints.maxWidth / 190).floor().clamp(2, 5).toInt();
-                  final tile = (constraints.maxWidth - spacing * (columns - 1)) / columns;
-                  return Wrap(
-                    spacing: spacing,
-                    runSpacing: spacing,
-                    children: [
-                      _Stat(
-                        width: tile,
-                        label: api.isSupplier
-                            ? 'Awaiting your decision'
-                            : 'Awaiting verification',
-                        value: '${data['awaiting_action']}',
-                        seed: Colors.orange,
-                        icon: Icons.pending_actions,
-                      ),
-                      _Stat(
-                        width: tile,
-                        label: 'Requests total',
-                        value: '${data['requests_total']}',
-                        seed: Colors.blue,
-                        icon: Icons.assignment,
-                      ),
-                      _Stat(
-                        width: tile,
-                        label: 'In transit',
-                        value: '${data['deliveries_in_transit']}',
-                        seed: Colors.indigo,
-                        icon: Icons.local_shipping,
-                      ),
-                      _Stat(
-                        width: tile,
-                        label: api.isSupplier ? 'Receivable' : 'Payable',
-                        value: amount(data['invoices_outstanding']),
-                        seed: Colors.red,
-                        icon: Icons.receipt_long,
-                      ),
-                      if ((data['invoices_overdue'] as int? ?? 0) > 0)
-                        _Stat(
-                          width: tile,
-                          label: '${data['invoices_overdue']} overdue',
-                          value: amount(data['invoices_overdue_amount']),
-                          seed: Colors.deepOrange,
-                          icon: Icons.event_busy,
-                        ),
-                      if ((data['payments_pending'] as int? ?? 0) > 0)
+          // Keyed by the fetch, so every reload remounts the figures and
+          // charts and they play in again; the PageStorageKey keeps the
+          // scroll offset across that remount. No cache extent, so a chart
+          // scrolled out is dropped and plays in again on the way back.
+          return KeyedSubtree(
+            key: ObjectKey(data),
+            child: ListView(
+              key: const PageStorageKey('dashboard'),
+              cacheExtent: 0,
+              // Explicit padding, so the bar's inset has to be added by hand.
+              padding: listInset(context, const EdgeInsets.all(12)),
+              children: [
+                // As many tiles per row as fit at a readable size, and never
+                // fewer than two: one column wastes a phone, and the fixed 168
+                // this used to be left a ragged tail of dead space on a monitor.
+                LayoutBuilder(
+                  builder: (context, constraints) {
+                    const spacing = 10.0;
+                    final columns = (constraints.maxWidth / 190).floor().clamp(2, 5).toInt();
+                    final tile = (constraints.maxWidth - spacing * (columns - 1)) / columns;
+                    return Wrap(
+                      spacing: spacing,
+                      runSpacing: spacing,
+                      children: [
                         _Stat(
                           width: tile,
                           label: api.isSupplier
-                              ? 'Payments to confirm'
-                              : 'Payments awaiting confirmation',
-                          value: '${data['payments_pending']}',
-                          seed: Colors.amber,
-                          icon: Icons.payments_outlined,
+                              ? 'Awaiting your decision'
+                              : 'Awaiting verification',
+                          value: '${data['awaiting_action']}',
+                          seed: Colors.orange,
+                          icon: Icons.pending_actions,
                         ),
-                      _Stat(
-                        width: tile,
-                        label: api.isSupplier ? 'Hospitals' : 'Companies',
-                        value: '${data['partners']}',
-                        seed: Colors.teal,
-                        icon: Icons.handshake,
-                      ),
-                      if (data['catalogue_items'] != null)
                         _Stat(
                           width: tile,
-                          label: 'Catalogue items',
-                          value: '${data['catalogue_items']}',
-                          seed: Colors.purple,
-                          icon: Icons.medication,
+                          label: 'Requests total',
+                          value: '${data['requests_total']}',
+                          seed: Colors.blue,
+                          icon: Icons.assignment,
                         ),
-                    ],
-                  );
-                },
-              ),
-              const SizedBox(height: 16),
-              if (byStatus.isNotEmpty) ...[
-                const _SectionTitle('Requests by status'),
-                Card(
-                  child: Padding(
-                    padding: const EdgeInsets.all(12),
-                    child: _StatusDonut(byStatus: byStatus),
-                  ),
-                ),
-              ],
-              if (monthly.isNotEmpty) ...[
-                const _SectionTitle('Requests per month'),
-                Card(
-                  child: Padding(
-                    padding: const EdgeInsets.fromLTRB(12, 12, 12, 12),
-                    child: Column(
-                      children: [
-                        Align(
-                          alignment: Alignment.centerRight,
-                          child: SegmentedButton<int>(
-                            showSelectedIcon: false,
-                            style: const ButtonStyle(visualDensity: VisualDensity.compact),
-                            segments: const [
-                              ButtonSegment(value: 3, label: Text('3m')),
-                              ButtonSegment(value: 6, label: Text('6m')),
-                              ButtonSegment(value: 12, label: Text('12m')),
-                            ],
-                            selected: {_months},
-                            onSelectionChanged: (choice) {
-                              setState(() => _months = choice.first);
-                              _controller.reload();
-                            },
+                        _Stat(
+                          width: tile,
+                          label: 'In transit',
+                          value: '${data['deliveries_in_transit']}',
+                          seed: Colors.indigo,
+                          icon: Icons.local_shipping,
+                        ),
+                        _Stat(
+                          width: tile,
+                          label: api.isSupplier ? 'Receivable' : 'Payable',
+                          value: amount(data['invoices_outstanding']),
+                          seed: Colors.red,
+                          icon: Icons.receipt_long,
+                        ),
+                        if ((data['invoices_overdue'] as int? ?? 0) > 0)
+                          _Stat(
+                            width: tile,
+                            label: '${data['invoices_overdue']} overdue',
+                            value: amount(data['invoices_overdue_amount']),
+                            seed: Colors.deepOrange,
+                            icon: Icons.event_busy,
                           ),
-                        ),
-                        const SizedBox(height: 12),
-                        _MonthlyBars(
-                          rows: monthly,
-                          onTap: (month) => Navigator.push(
-                            context,
-                            MaterialPageRoute<void>(builder: (_) => RequestsScreen(month: month)),
+                        if ((data['payments_pending'] as int? ?? 0) > 0)
+                          _Stat(
+                            width: tile,
+                            label: api.isSupplier
+                                ? 'Payments to confirm'
+                                : 'Payments awaiting confirmation',
+                            value: '${data['payments_pending']}',
+                            seed: Colors.amber,
+                            icon: Icons.payments_outlined,
                           ),
+                        _Stat(
+                          width: tile,
+                          label: api.isSupplier ? 'Hospitals' : 'Companies',
+                          value: '${data['partners']}',
+                          seed: Colors.teal,
+                          icon: Icons.handshake,
                         ),
+                        if (data['catalogue_items'] != null)
+                          _Stat(
+                            width: tile,
+                            label: 'Catalogue items',
+                            value: '${data['catalogue_items']}',
+                            seed: Colors.purple,
+                            icon: Icons.medication,
+                          ),
                       ],
+                    );
+                  },
+                ),
+                const SizedBox(height: 16),
+                if (byStatus.isNotEmpty) ...[
+                  const _SectionTitle('Requests by status'),
+                  Card(
+                    child: Padding(
+                      padding: const EdgeInsets.all(12),
+                      child: _StatusDonut(byStatus: byStatus),
                     ),
                   ),
-                ),
-              ],
-              if (spend.isNotEmpty) ...[
-                const _SectionTitle('Invoiced by department'),
-                Card(
-                  child: Padding(
-                    padding: const EdgeInsets.symmetric(vertical: 4),
-                    child: Column(
-                      children: [
-                        for (final row in spend)
-                          _DepartmentBar(
-                            name: '${row['department_name']}',
-                            total: qty(row['total']),
-                            paid: qty(row['paid']),
-                            // Bars share one scale, so the widest is the biggest
-                            // department rather than every row reading as full.
-                            scale: spend
-                                .map((r) => qty(r['total']))
-                                .reduce((a, b) => a > b ? a : b),
-                            onTap: () => Navigator.push(
-                              context,
-                              MaterialPageRoute<void>(
-                                builder: (_) =>
-                                    RequestsScreen(department: row['department_id'] as int),
-                              ),
+                ],
+                if (monthly.isNotEmpty) ...[
+                  const _SectionTitle('Requests per month'),
+                  Card(
+                    child: Padding(
+                      padding: const EdgeInsets.fromLTRB(12, 12, 12, 12),
+                      child: Column(
+                        children: [
+                          Align(
+                            alignment: Alignment.centerRight,
+                            child: SegmentedButton<int>(
+                              showSelectedIcon: false,
+                              style: const ButtonStyle(visualDensity: VisualDensity.compact),
+                              segments: const [
+                                ButtonSegment(value: 3, label: Text('3m')),
+                                ButtonSegment(value: 6, label: Text('6m')),
+                                ButtonSegment(value: 12, label: Text('12m')),
+                              ],
+                              selected: {_months},
+                              onSelectionChanged: (choice) {
+                                setState(() => _months = choice.first);
+                                _controller.reload();
+                              },
                             ),
                           ),
+                          const SizedBox(height: 12),
+                          _MonthlyBars(
+                            rows: monthly,
+                            onTap: (month) => Navigator.push(
+                              context,
+                              MaterialPageRoute<void>(builder: (_) => RequestsScreen(month: month)),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ],
+                if (spend.isNotEmpty) ...[
+                  const _SectionTitle('Invoiced by department'),
+                  Card(
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(vertical: 4),
+                      child: Column(
+                        children: [
+                          for (final row in spend)
+                            _DepartmentBar(
+                              name: '${row['department_name']}',
+                              total: qty(row['total']),
+                              paid: qty(row['paid']),
+                              // Bars share one scale, so the widest is the biggest
+                              // department rather than every row reading as full.
+                              scale: spend
+                                  .map((r) => qty(r['total']))
+                                  .reduce((a, b) => a > b ? a : b),
+                              onTap: () => Navigator.push(
+                                context,
+                                MaterialPageRoute<void>(
+                                  builder: (_) =>
+                                      RequestsScreen(department: row['department_id'] as int),
+                                ),
+                              ),
+                            ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ],
+                if (lowStock.isNotEmpty) ...[
+                  const _SectionTitle('Low stock (under 10)'),
+                  Card(
+                    child: Column(
+                      children: [
+                        for (final item in lowStock)
+                          ListTile(
+                            dense: true,
+                            leading: Icon(
+                              Icons.warning_amber,
+                              color: Theme.of(context).colorScheme.error,
+                            ),
+                            title: Text('${item['generic_name']}'),
+                            trailing: Text('${qtyText(item['stock_qty'])} left'),
+                          ),
                       ],
                     ),
                   ),
-                ),
-              ],
-              if (lowStock.isNotEmpty) ...[
-                const _SectionTitle('Low stock (under 10)'),
-                Card(
-                  child: Column(
-                    children: [
-                      for (final item in lowStock)
-                        ListTile(
-                          dense: true,
-                          leading: Icon(
-                            Icons.warning_amber,
-                            color: Theme.of(context).colorScheme.error,
-                          ),
-                          title: Text('${item['generic_name']}'),
-                          trailing: Text('${qtyText(item['stock_qty'])} left'),
-                        ),
-                    ],
-                  ),
-                ),
-              ],
-              const _SectionTitle('Recent requests'),
-              if (recent.isEmpty)
-                Padding(
-                  padding: const EdgeInsets.all(24),
-                  child: Text(
-                    'Nothing yet.',
-                    style: TextStyle(color: Theme.of(context).colorScheme.onSurfaceVariant),
-                  ),
-                ),
-              for (final row in recent)
-                Card(
-                  child: ListTile(
-                    title: Text('${row['reference']} · ${row['item_count']} item(s)'),
-                    subtitle: Text(
-                      api.isSupplier
-                          ? '${row['hospital_name']} · ${formatDate(row['submitted_at'])}'
-                          : '${row['supplier_name']} · ${formatDate(row['created_at'])}',
+                ],
+                const _SectionTitle('Recent requests'),
+                if (recent.isEmpty)
+                  Padding(
+                    padding: const EdgeInsets.all(24),
+                    child: Text(
+                      'Nothing yet.',
+                      style: TextStyle(color: Theme.of(context).colorScheme.onSurfaceVariant),
                     ),
-                    trailing: StatusChip('${row['status']}'),
-                    onTap: () async {
-                      await Navigator.push(
-                        context,
-                        MaterialPageRoute<void>(
-                          builder: (_) => RequestDetailScreen(requisitionId: row['id'] as int),
-                        ),
-                      );
-                      reload();
-                    },
                   ),
-                ),
-            ],
+                for (final row in recent)
+                  Card(
+                    child: ListTile(
+                      title: Text('${row['reference']} · ${row['item_count']} item(s)'),
+                      subtitle: Text(
+                        api.isSupplier
+                            ? '${row['hospital_name']} · ${formatDate(row['submitted_at'])}'
+                            : '${row['supplier_name']} · ${formatDate(row['created_at'])}',
+                      ),
+                      trailing: StatusChip('${row['status']}'),
+                      onTap: () async {
+                        await Navigator.push(
+                          context,
+                          MaterialPageRoute<void>(
+                            builder: (_) => RequestDetailScreen(requisitionId: row['id'] as int),
+                          ),
+                        );
+                        reload();
+                      },
+                    ),
+                  ),
+              ],
+            ),
           );
         },
       ),
@@ -298,6 +306,9 @@ class _Stat extends StatelessWidget {
     // The tint keeps each tile's tonal colour; only the material changes.
     // One reading, not two: a screen reader announcing '4' and then 'Awaiting
     // your decision' as separate nodes leaves the number floating.
+    // A plain count climbs to its figure; an amount already carries a currency
+    // and separators, so it fades in whole instead.
+    final count = int.tryParse(value);
     return Semantics(
       label: '$label: $value',
       excludeSemantics: true,
@@ -315,9 +326,14 @@ class _Stat extends StatelessWidget {
             FittedBox(
               fit: BoxFit.scaleDown,
               alignment: Alignment.centerLeft,
-              child: Text(
-                value,
-                style: textTheme.headlineSmall?.copyWith(color: scheme.onPrimaryContainer),
+              child: Reveal(
+                builder: (_, t) => Opacity(
+                  opacity: count == null ? t : 1,
+                  child: Text(
+                    count == null ? value : '${(count * t).round()}',
+                    style: textTheme.headlineSmall?.copyWith(color: scheme.onPrimaryContainer),
+                  ),
+                ),
               ),
             ),
             Text(label, style: textTheme.labelMedium?.copyWith(color: scheme.onPrimaryContainer)),
@@ -361,15 +377,17 @@ class _StatusDonut extends StatelessWidget {
           child: SizedBox(
             width: 120,
             height: 120,
-            child: CustomPaint(
-              painter: _DonutPainter(slices: slices, total: total),
-              child: Center(
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Text('${total.round()}', style: textTheme.headlineSmall),
-                    Text('total', style: textTheme.labelSmall),
-                  ],
+            child: Reveal(
+              builder: (_, t) => CustomPaint(
+                painter: _DonutPainter(slices: slices, total: total, progress: t),
+                child: Center(
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Text('${(total * t).round()}', style: textTheme.headlineSmall),
+                      Text('total', style: textTheme.labelSmall),
+                    ],
+                  ),
                 ),
               ),
             ),
@@ -413,10 +431,14 @@ class _StatusDonut extends StatelessWidget {
 }
 
 class _DonutPainter extends CustomPainter {
-  _DonutPainter({required this.slices, required this.total});
+  _DonutPainter({required this.slices, required this.total, required this.progress});
 
   final List<({String label, double value, Color color, IconData icon})> slices;
   final double total;
+
+  /// How much of the ring has been drawn so far, 0 to 1: it sweeps in
+  /// clockwise from twelve o'clock as the screen settles.
+  final double progress;
 
   /// The hairline between two slices, in radians. Dropped on a slice too thin
   /// to survive it, which would otherwise paint backwards.
@@ -434,16 +456,20 @@ class _DonutPainter extends CustomPainter {
       ..strokeWidth = stroke;
     // Twelve o'clock, clockwise: where a ring is read from.
     var start = -math.pi / 2;
+    var left = progress * 2 * math.pi;
     for (final slice in slices) {
-      final sweep = slice.value / total * 2 * math.pi;
+      if (left <= 0) break;
+      final sweep = math.min(slice.value / total * 2 * math.pi, left);
       final inset = sweep > gap * 2 && slices.length > 1 ? gap : 0.0;
       canvas.drawArc(rect, start + inset / 2, sweep - inset, false, paint..color = slice.color);
       start += sweep;
+      left -= sweep;
     }
   }
 
   @override
-  bool shouldRepaint(_DonutPainter old) => old.slices != slices || old.total != total;
+  bool shouldRepaint(_DonutPainter old) =>
+      old.slices != slices || old.total != total || old.progress != progress;
 }
 
 /// Requests per month as a column chart. Six buckets, so they are drawn as
@@ -456,6 +482,23 @@ class _MonthlyBars extends StatelessWidget {
   /// Opens the requests behind one bar, by the ISO date of that month.
   final void Function(String month) onTap;
 
+  /// One accent per bar, cycled by position: twelve months get twelve hues,
+  /// so neighbours are told apart without a legend. Same seeds as the tiles.
+  static const seeds = [
+    Colors.blue,
+    Colors.teal,
+    Colors.orange,
+    Colors.purple,
+    Colors.indigo,
+    Colors.red,
+    Colors.green,
+    Colors.amber,
+    Colors.cyan,
+    Colors.deepOrange,
+    Colors.pink,
+    Colors.lightGreen,
+  ];
+
   @override
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
@@ -463,48 +506,59 @@ class _MonthlyBars extends StatelessWidget {
     final peak = rows.map((row) => qty(row['count'])).reduce(math.max);
     return SizedBox(
       height: 140 * textScale(context),
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.end,
-        children: [
-          for (final row in rows)
-            Expanded(
-              child: Semantics(
-                button: true,
-                label:
-                    '${monthLabel('${row['month']}')}: '
-                    '${qty(row['count']).round()} requests',
-                excludeSemantics: true,
-                child: InkWell(
-                  // An empty month opens an empty list, which is an answer too.
-                  onTap: () => onTap('${row['month']}'),
-                  child: Column(
-                    mainAxisAlignment: MainAxisAlignment.end,
-                    children: [
-                      Text('${qty(row['count']).round()}', style: textTheme.labelSmall),
-                      const SizedBox(height: 2),
-                      Expanded(
-                        child: FractionallySizedBox(
-                          // The tallest bar fills the plot; an empty month keeps a
-                          // sliver so the column still reads as a bar.
-                          heightFactor: peak > 0 ? math.max(qty(row['count']) / peak, 0.02) : 0.02,
-                          alignment: Alignment.bottomCenter,
-                          widthFactor: 0.55,
-                          child: DecoratedBox(
-                            decoration: BoxDecoration(
-                              color: scheme.primary,
-                              borderRadius: const BorderRadius.vertical(top: Radius.circular(4)),
+      child: Reveal(
+        builder: (context, t) => Row(
+          crossAxisAlignment: CrossAxisAlignment.end,
+          children: [
+            for (final (i, row) in rows.indexed)
+              Expanded(
+                child: Semantics(
+                  button: true,
+                  label:
+                      '${monthLabel('${row['month']}')}: '
+                      '${qty(row['count']).round()} requests',
+                  excludeSemantics: true,
+                  child: InkWell(
+                    // An empty month opens an empty list, which is an answer too.
+                    onTap: () => onTap('${row['month']}'),
+                    child: Column(
+                      mainAxisAlignment: MainAxisAlignment.end,
+                      children: [
+                        Text('${(qty(row['count']) * t).round()}', style: textTheme.labelSmall),
+                        const SizedBox(height: 2),
+                        Expanded(
+                          child: FractionallySizedBox(
+                            // The tallest bar fills the plot; an empty month keeps a
+                            // sliver so the column still reads as a bar.
+                            heightFactor:
+                                (peak > 0 ? math.max(qty(row['count']) / peak, 0.02) : 0.02) * t,
+                            alignment: Alignment.bottomCenter,
+                            widthFactor: 0.55,
+                            child: DecoratedBox(
+                              decoration: BoxDecoration(
+                                // Tints in from the track colour as it grows.
+                                color: Color.lerp(
+                                  scheme.surfaceContainerHighest,
+                                  tonalScheme(context, seeds[i % seeds.length]).primary,
+                                  t,
+                                ),
+                                borderRadius: const BorderRadius.vertical(top: Radius.circular(4)),
+                              ),
                             ),
                           ),
                         ),
-                      ),
-                      const SizedBox(height: 4),
-                      Text(monthLabel('${row['month']}', short: true), style: textTheme.labelSmall),
-                    ],
+                        const SizedBox(height: 4),
+                        Text(
+                          monthLabel('${row['month']}', short: true),
+                          style: textTheme.labelSmall,
+                        ),
+                      ],
+                    ),
                   ),
                 ),
               ),
-            ),
-        ],
+          ],
+        ),
       ),
     );
   }
@@ -554,15 +608,17 @@ class _DepartmentBar extends StatelessWidget {
                 child: Container(
                   height: 8,
                   color: scheme.surfaceContainerHighest,
-                  child: FractionallySizedBox(
-                    alignment: Alignment.centerLeft,
-                    widthFactor: scale > 0 ? (total / scale).clamp(0.0, 1.0) : 0,
-                    child: Container(
-                      color: scheme.primaryContainer,
-                      child: FractionallySizedBox(
-                        alignment: Alignment.centerLeft,
-                        widthFactor: total > 0 ? (paid / total).clamp(0.0, 1.0) : 0,
-                        child: Container(color: scheme.primary),
+                  child: Reveal(
+                    builder: (_, t) => FractionallySizedBox(
+                      alignment: Alignment.centerLeft,
+                      widthFactor: scale > 0 ? (total / scale).clamp(0.0, 1.0) * t : 0,
+                      child: Container(
+                        color: scheme.primaryContainer,
+                        child: FractionallySizedBox(
+                          alignment: Alignment.centerLeft,
+                          widthFactor: total > 0 ? (paid / total).clamp(0.0, 1.0) : 0,
+                          child: Container(color: scheme.primary),
+                        ),
                       ),
                     ),
                   ),

@@ -612,6 +612,57 @@ class _DebouncedSearchBarState extends State<_DebouncedSearchBar> {
   }
 }
 
+/// A slow ease from 0 to 1 when the widget first appears. Figures count up
+/// and charts grow by it, so a screen settles rather than pops. Honours the
+/// system's reduced-motion setting by finishing at once.
+class Reveal extends StatelessWidget {
+  const Reveal({
+    super.key,
+    required this.builder,
+    this.duration = const Duration(milliseconds: 1400),
+  });
+
+  final Widget Function(BuildContext context, double t) builder;
+  final Duration duration;
+
+  @override
+  Widget build(BuildContext context) {
+    return TweenAnimationBuilder<double>(
+      tween: Tween(begin: 0, end: 1),
+      duration: MediaQuery.disableAnimationsOf(context) ? Duration.zero : duration,
+      curve: Curves.easeOutCubic,
+      builder: (context, t, _) => builder(context, t),
+    );
+  }
+}
+
+/// A centred spinner that fades and scales in, so a fast load never blinks one.
+class Spinner extends StatelessWidget {
+  const Spinner({super.key, this.height});
+
+  /// Fixed height for a spinner standing in for a list, so the page keeps its shape.
+  final double? height;
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox(
+      height: height,
+      child: Center(
+        child: Reveal(
+          duration: const Duration(milliseconds: 800),
+          builder: (_, t) => Opacity(
+            opacity: t,
+            child: Transform.scale(
+              scale: 0.6 + 0.4 * t,
+              child: const CircularProgressIndicator(),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
 /// Loads once, rebuilds on pull-to-refresh, shows errors instead of a blank screen.
 class Loader<T> extends StatefulWidget {
   const Loader({
@@ -682,11 +733,18 @@ class _LoaderState<T> extends State<Loader<T>> {
     return Stack(
       children: [
         body,
-        const Positioned(
+        Positioned(
           top: 0,
           left: 0,
           right: 0,
-          child: LinearProgressIndicator(minHeight: 2),
+          // Eased in, so a refetch that lands fast never flashes a bar.
+          child: Reveal(
+            duration: const Duration(milliseconds: 600),
+            builder: (_, t) => Opacity(
+              opacity: t,
+              child: const LinearProgressIndicator(minHeight: 2),
+            ),
+          ),
         ),
       ],
     );
@@ -699,7 +757,7 @@ class _LoaderState<T> extends State<Loader<T>> {
       builder: (context, snapshot) {
         if (snapshot.connectionState != ConnectionState.done) {
           // Nothing has ever loaded here, so there is nothing to keep up.
-          if (_last == null) return const Center(child: CircularProgressIndicator());
+          if (_last == null) return const Spinner();
           return _content(context, _last as T, loading: true);
         }
         if (snapshot.hasError) {

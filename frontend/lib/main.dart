@@ -224,9 +224,17 @@ class _IdleWarning extends StatelessWidget {
               content: TweenAnimationBuilder<double>(
                 tween: Tween(begin: idleWarning.inSeconds.toDouble(), end: 0),
                 duration: idleWarning,
-                builder: (context, seconds, _) => Text(
-                  'This session ends in ${seconds.ceil()} seconds so an '
-                  'unattended screen does not stay signed in.',
+                builder: (context, seconds, _) => Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Text(
+                      'This session ends in ${seconds.ceil()} seconds so an '
+                      'unattended screen does not stay signed in.',
+                    ),
+                    const SizedBox(height: 16),
+                    // The same countdown as a draining bar, for a glance.
+                    LinearProgressIndicator(value: seconds / idleWarning.inSeconds),
+                  ],
                 ),
               ),
               actions: [
@@ -269,7 +277,7 @@ class _Gate extends StatelessWidget {
               const SizedBox(height: 8),
               Text('PPP Supply', style: Theme.of(context).textTheme.headlineMedium),
               const SizedBox(height: 24),
-              const CircularProgressIndicator(),
+              const Spinner(),
             ],
           ),
         ),

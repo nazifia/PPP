@@ -287,7 +287,7 @@ class _NewRequestDialogState extends State<_NewRequestDialog> {
           future: Future.wait([api.list('/companies/'), tagOptions(api)]),
           builder: (context, snapshot) {
             if (!snapshot.hasData) {
-              return const SizedBox(height: 80, child: Center(child: CircularProgressIndicator()));
+              return const Spinner(height: 80);
             }
             final companies = snapshot.data![0];
             final tags = snapshot.data![1];
@@ -1010,7 +1010,7 @@ class _AddLineDialogState extends State<_AddLineDialog> {
                     itemBuilder: (context, index) => index == items.length
                         ? const Padding(
                             padding: EdgeInsets.all(16),
-                            child: Center(child: CircularProgressIndicator()),
+                            child: Spinner(),
                           )
                         : _itemRow(items[index]),
                   );

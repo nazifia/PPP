@@ -1424,7 +1424,7 @@ class _RaiseCreditDialogState extends State<_RaiseCreditDialog> {
           future: _lines,
           builder: (context, snapshot) {
             if (snapshot.connectionState != ConnectionState.done) {
-              return const SizedBox(height: 80, child: Center(child: CircularProgressIndicator()));
+              return const Spinner(height: 80);
             }
             if (snapshot.hasError) return Text('${snapshot.error}');
             final open = [
@@ -2177,7 +2177,7 @@ class _StockLedgerScreenState extends State<StockLedgerScreen> {
                   itemBuilder: (context, index) => index == rows.length
                       ? const Padding(
                           padding: EdgeInsets.all(16),
-                          child: Center(child: CircularProgressIndicator()),
+                          child: Spinner(),
                         )
                       : _showBalances
                       ? _balanceTile(rows[index])
@@ -2393,7 +2393,7 @@ class _DispenseDialogState extends State<_DispenseDialog> {
           future: _held,
           builder: (context, snapshot) {
             if (snapshot.connectionState != ConnectionState.done) {
-              return const SizedBox(height: 80, child: Center(child: CircularProgressIndicator()));
+              return const Spinner(height: 80);
             }
             if (snapshot.hasError) return Text('${snapshot.error}');
             final stocked = snapshot.data!;
@@ -2542,7 +2542,7 @@ class _AdjustDialogState extends State<_AdjustDialog> {
           future: _held,
           builder: (context, snapshot) {
             if (snapshot.connectionState != ConnectionState.done) {
-              return const SizedBox(height: 80, child: Center(child: CircularProgressIndicator()));
+              return const Spinner(height: 80);
             }
             if (snapshot.hasError) return Text('${snapshot.error}');
             final rows = snapshot.data!;
