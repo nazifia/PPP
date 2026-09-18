@@ -365,20 +365,23 @@ class _StatusDonut extends StatelessWidget {
     ]..sort((a, b) => b.value.compareTo(a.value));
     final total = slices.fold<double>(0, (sum, slice) => sum + slice.value);
     if (total <= 0) return const SizedBox.shrink();
-    return Row(
-      crossAxisAlignment: CrossAxisAlignment.center,
-      children: [
-        // The ring paints on a canvas, which carries no semantics of its own.
-        // The legend beside it already reads the counts out, so this only has
-        // to name what the picture is.
-        Semantics(
-          label: 'Requests by status, ${total.round()} in total',
-          excludeSemantics: true,
-          child: SizedBox(
-            width: 120,
-            height: 120,
-            child: Reveal(
-              builder: (_, t) => CustomPaint(
+    // One reveal over the whole row rather than one around the ring: the legend
+    // counts the same slices, so it climbs on the clock the ring sweeps on
+    // instead of standing at its final figures beside a half-drawn picture.
+    return Reveal(
+      builder: (context, t) => Row(
+        crossAxisAlignment: CrossAxisAlignment.center,
+        children: [
+          // The ring paints on a canvas, which carries no semantics of its own.
+          // The legend beside it already reads the counts out, so this only has
+          // to name what the picture is.
+          Semantics(
+            label: 'Requests by status, ${total.round()} in total',
+            excludeSemantics: true,
+            child: SizedBox(
+              width: 120,
+              height: 120,
+              child: CustomPaint(
                 painter: _DonutPainter(slices: slices, total: total, progress: t),
                 child: Center(
                   child: Column(
@@ -392,40 +395,43 @@ class _StatusDonut extends StatelessWidget {
               ),
             ),
           ),
-        ),
-        const SizedBox(width: 12),
-        Expanded(
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              for (final slice in slices)
-                Padding(
-                  padding: const EdgeInsets.symmetric(vertical: 3),
-                  child: Row(
-                    children: [
-                      // The status's own icon rather than a plain dot: the
-                      // ring's slices are told apart by hue, which approved
-                      // green and rejected red do not survive.
-                      Icon(slice.icon, size: 14, color: slice.color),
-                      const SizedBox(width: 8),
-                      Expanded(
-                        child: Text(
-                          slice.label,
-                          overflow: TextOverflow.ellipsis,
-                          style: textTheme.bodySmall,
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                for (final slice in slices)
+                  Padding(
+                    padding: const EdgeInsets.symmetric(vertical: 3),
+                    child: Row(
+                      children: [
+                        // The status's own icon rather than a plain dot: the
+                        // ring's slices are told apart by hue, which approved
+                        // green and rejected red do not survive.
+                        Icon(slice.icon, size: 14, color: slice.color),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: Text(
+                            slice.label,
+                            overflow: TextOverflow.ellipsis,
+                            style: textTheme.bodySmall,
+                          ),
                         ),
-                      ),
-                      Text(
-                        '${slice.value.round()} · ${(slice.value / total * 100).round()}%',
-                        style: textTheme.labelMedium,
-                      ),
-                    ],
+                        // The count climbs; the share it is of the whole does
+                        // not, being true of the slice from the first frame.
+                        Text(
+                          '${(slice.value * t).round()} · '
+                          '${(slice.value / total * 100).round()}%',
+                          style: textTheme.labelMedium,
+                        ),
+                      ],
+                    ),
                   ),
-                ),
-            ],
+              ],
+            ),
           ),
-        ),
-      ],
+        ],
+      ),
     );
   }
 }
@@ -592,24 +598,30 @@ class _DepartmentBar extends StatelessWidget {
         onTap: onTap,
         child: Padding(
           padding: const EdgeInsets.fromLTRB(16, 8, 16, 8),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Row(
-                children: [
-                  Expanded(child: Text(name, overflow: TextOverflow.ellipsis)),
-                  const SizedBox(width: 8),
-                  Text(amount(total), style: textTheme.titleSmall),
-                ],
-              ),
-              const SizedBox(height: 6),
-              ClipRRect(
-                borderRadius: BorderRadius.circular(4),
-                child: Container(
-                  height: 8,
-                  color: scheme.surfaceContainerHighest,
-                  child: Reveal(
-                    builder: (_, t) => FractionallySizedBox(
+          // One reveal for the row: the bar grows and the two amounts reading
+          // it fade in together. An amount carries a currency and separators,
+          // so it fades in whole rather than counting up, as the tiles do.
+          child: Reveal(
+            builder: (context, t) => Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    Expanded(child: Text(name, overflow: TextOverflow.ellipsis)),
+                    const SizedBox(width: 8),
+                    Opacity(
+                      opacity: t,
+                      child: Text(amount(total), style: textTheme.titleSmall),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 6),
+                ClipRRect(
+                  borderRadius: BorderRadius.circular(4),
+                  child: Container(
+                    height: 8,
+                    color: scheme.surfaceContainerHighest,
+                    child: FractionallySizedBox(
                       alignment: Alignment.centerLeft,
                       widthFactor: scale > 0 ? (total / scale).clamp(0.0, 1.0) * t : 0,
                       child: Container(
@@ -623,10 +635,13 @@ class _DepartmentBar extends StatelessWidget {
                     ),
                   ),
                 ),
-              ),
-              const SizedBox(height: 4),
-              Text('${amount(paid)} paid', style: textTheme.bodySmall),
-            ],
+                const SizedBox(height: 4),
+                Opacity(
+                  opacity: t,
+                  child: Text('${amount(paid)} paid', style: textTheme.bodySmall),
+                ),
+              ],
+            ),
           ),
         ),
       ),

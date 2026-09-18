@@ -677,7 +677,7 @@ class _AskDialogState extends State<_AskDialog> {
                         if (stock.connectionState != ConnectionState.done) {
                           return const Padding(
                             padding: EdgeInsets.all(12),
-                            child: CircularProgressIndicator(),
+                            child: Spinner(),
                           );
                         }
                         final rows = stock.data ?? const <Map<String, dynamic>>[];
