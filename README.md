@@ -61,7 +61,9 @@ new item, and the items already described by it keep it.
 
 An organisation administrator opens the accounts inside it, edits any detail of one —
 name, phone, email, job title and role, between `ADMIN` and `STAFF` — resets a forgotten
-password (held to the same validators as sign-up, and the owner must change it at next login)
+password (held to the same validators as sign-up, and the owner must change it at next login —
+the API answers 403 to everything but `/auth/me/`, `/auth/change-password/` and `/auth/logout/`
+until they do)
 and disables an account — `DELETE /users/{id}/`, which also cuts the login token.
 `PATCH /users/{id}/` with `is_active: true` turns it back on. Two things are refused, so a
 tenant can never be locked out of its own account management: nobody disables their own
@@ -111,7 +113,7 @@ DRAFT ──submit──▶ SUBMITTED ──decide──┬─▶ APPROVED ─�
    decision count as rejected — silence is never a promise.
    All zero → `REJECTED`; some short → `PARTIALLY_APPROVED`; everything in full → `APPROVED`.
 4. **Dispatch.** The company ships all or part of what it approved, with batch numbers and
-   expiry dates. Stock leaves the shelf here, not at approval, the reservation is released by
+   expiry dates; a batch already past its date is refused. Stock leaves the shelf here, not at approval, the reservation is released by
    the same amount, and a `StockMovement` records it. A request can carry several consignments.
 5. **Verify.** The hospital counts what arrived and accepts or rejects each line; a rejected
    quantity needs a written reason. Accepted goods enter the hospital's stock ledger and an
@@ -121,7 +123,8 @@ DRAFT ──submit──▶ SUBMITTED ──decide──┬─▶ APPROVED ─�
 7. **Dispense.** Hospital staff record what a ward hands out, which is what draws the goods
    back out of the hospital's ledger. No approval: the item has already been used. A
    hospital owns no catalogue row, so its ledger is the only record of what it holds, and
-   nothing may be dispensed beyond what that ledger adds up to.
+   nothing may be dispensed beyond what that ledger adds up to. Off a unit's shelf it takes
+   that unit's own staff or an administrator, the same rule a transfer answers to.
 8. **Write off.** Dispensing means a ward used the goods. Everything else that takes
    something off the shelf — a drug past its date, a broken vial, a count that never
    matched the book — is `POST /stock-movements/adjust/`: a signed quantity and a reason,

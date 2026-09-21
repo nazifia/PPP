@@ -113,6 +113,9 @@ def dispense(user, product, qty, note='', unit=None):
         raise ValidationError('Dispensed quantity must be greater than zero.')
     if unit is not None:
         require_own_unit(user, unit)
+        # A unit's shelf is handed off by the people standing at it, as it is
+        # when the unit lends to the one next door; the store is everybody's.
+        require_unit_member(user, unit, 'hand out its stock')
     # The catalogue row is the lock, as it is for a supplier dispatch, so two
     # dispenses cannot both read the same balance and overdraw it.
     # ponytail: that serialises every hospital holding the item; lock per
@@ -353,13 +356,18 @@ def dispatch(requisition, user, items, waybill_no=''):
         product = Product.objects.select_for_update().get(pk=line.product_id)
         if qty > product.stock_qty:
             raise ValidationError(f'{product}: only {product.stock_qty} in stock.')
+        expiry = item.get('expiry_date') or None
+        # Goods already out of date are not goods; the hospital would only
+        # reject them at the door, and the van has been paid for by then.
+        if expiry is not None and expiry < timezone.localdate():
+            raise ValidationError(f'{product}: that batch expired on {expiry}.')
 
         DeliveryLine.objects.create(
             delivery=delivery,
             requisition_line=line,
             qty_supplied=qty,
             batch_no=item.get('batch_no', '') or '',
-            expiry_date=item.get('expiry_date') or None,
+            expiry_date=expiry,
         )
         product.stock_qty -= qty
         product.qty_reserved = max(product.qty_reserved - qty, 0)

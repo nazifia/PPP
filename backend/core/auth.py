@@ -4,7 +4,7 @@ from datetime import timedelta
 
 from django.utils import timezone
 from rest_framework.authentication import TokenAuthentication
-from rest_framework.exceptions import AuthenticationFailed
+from rest_framework.exceptions import AuthenticationFailed, PermissionDenied
 
 from .models import Organization, User
 
@@ -18,6 +18,13 @@ DEFAULT_IDLE_MINUTES = 30
 #: How often the last-seen stamp is written. Every authenticated request would
 #: mean a write per read, which this is not worth.
 LAST_SEEN_RESOLUTION = timedelta(seconds=60)
+
+#: What an account whose password was set by somebody else may still reach:
+#: enough to see who it is, change the password, or leave. The app already
+#: asks for a new password on sign-in; this is what makes that more than a
+#: request, since a client talking to the API directly would otherwise carry
+#: on under a password an administrator chose and may still know.
+MUST_CHANGE_PASSWORD_ROUTES = {'me', 'change-password', 'logout'}
 
 
 class ActAsOrgAuthentication(TokenAuthentication):
@@ -72,6 +79,11 @@ class ActAsOrgAuthentication(TokenAuthentication):
         if result is None:
             return None
         user, token = result
+        match = getattr(request, 'resolver_match', None)
+        if user.must_change_password and (
+            match is None or match.url_name not in MUST_CHANGE_PASSWORD_ROUTES
+        ):
+            raise PermissionDenied('Change your password before doing anything else.')
         if not user.is_superuser:
             return user, token
         org_id = (

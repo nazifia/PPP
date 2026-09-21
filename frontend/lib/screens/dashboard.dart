@@ -82,28 +82,29 @@ class _DashboardScreenState extends State<DashboardScreen> {
                           label: api.isSupplier
                               ? 'Awaiting your decision'
                               : 'Awaiting verification',
-                          value: '${data['awaiting_action']}',
+                          value: data['awaiting_action'],
                           seed: Colors.orange,
                           icon: Icons.pending_actions,
                         ),
                         _Stat(
                           width: tile,
                           label: 'Requests total',
-                          value: '${data['requests_total']}',
+                          value: data['requests_total'],
                           seed: Colors.blue,
                           icon: Icons.assignment,
                         ),
                         _Stat(
                           width: tile,
                           label: 'In transit',
-                          value: '${data['deliveries_in_transit']}',
+                          value: data['deliveries_in_transit'],
                           seed: Colors.indigo,
                           icon: Icons.local_shipping,
                         ),
                         _Stat(
                           width: tile,
                           label: api.isSupplier ? 'Receivable' : 'Payable',
-                          value: amount(data['invoices_outstanding']),
+                          value: data['invoices_outstanding'],
+                          money: true,
                           seed: Colors.red,
                           icon: Icons.receipt_long,
                         ),
@@ -111,7 +112,8 @@ class _DashboardScreenState extends State<DashboardScreen> {
                           _Stat(
                             width: tile,
                             label: '${data['invoices_overdue']} overdue',
-                            value: amount(data['invoices_overdue_amount']),
+                            value: data['invoices_overdue_amount'],
+                            money: true,
                             seed: Colors.deepOrange,
                             icon: Icons.event_busy,
                           ),
@@ -121,14 +123,14 @@ class _DashboardScreenState extends State<DashboardScreen> {
                             label: api.isSupplier
                                 ? 'Payments to confirm'
                                 : 'Payments awaiting confirmation',
-                            value: '${data['payments_pending']}',
+                            value: data['payments_pending'],
                             seed: Colors.amber,
                             icon: Icons.payments_outlined,
                           ),
                         _Stat(
                           width: tile,
                           label: api.isSupplier ? 'Hospitals' : 'Companies',
-                          value: '${data['partners']}',
+                          value: data['partners'],
                           seed: Colors.teal,
                           icon: Icons.handshake,
                         ),
@@ -136,7 +138,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
                           _Stat(
                             width: tile,
                             label: 'Catalogue items',
-                            value: '${data['catalogue_items']}',
+                            value: data['catalogue_items'],
                             seed: Colors.purple,
                             icon: Icons.medication,
                           ),
@@ -284,6 +286,7 @@ class _Stat extends StatelessWidget {
     required this.width,
     required this.label,
     required this.value,
+    this.money = false,
     required this.seed,
     required this.icon,
   });
@@ -293,7 +296,12 @@ class _Stat extends StatelessWidget {
   final double width;
 
   final String label;
-  final String value;
+
+  /// The raw figure from the server; formatted here so it can count up.
+  final dynamic value;
+
+  /// Format as currency rather than a plain count.
+  final bool money;
   final Color seed;
   final IconData icon;
 
@@ -306,11 +314,11 @@ class _Stat extends StatelessWidget {
     // The tint keeps each tile's tonal colour; only the material changes.
     // One reading, not two: a screen reader announcing '4' and then 'Awaiting
     // your decision' as separate nodes leaves the number floating.
-    // A plain count climbs to its figure; an amount already carries a currency
-    // and separators, so it fades in whole instead.
-    final count = int.tryParse(value);
+    // Both a count and an amount climb to their figure.
+    final figure = double.tryParse('$value') ?? 0;
+    String show(double t) => money ? amount(figure * t) : '${(figure * t).round()}';
     return Semantics(
-      label: '$label: $value',
+      label: '$label: ${show(1)}',
       excludeSemantics: true,
       child: Glass(
         width: width,
@@ -327,12 +335,9 @@ class _Stat extends StatelessWidget {
               fit: BoxFit.scaleDown,
               alignment: Alignment.centerLeft,
               child: Reveal(
-                builder: (_, t) => Opacity(
-                  opacity: count == null ? t : 1,
-                  child: Text(
-                    count == null ? value : '${(count * t).round()}',
-                    style: textTheme.headlineSmall?.copyWith(color: scheme.onPrimaryContainer),
-                  ),
+                builder: (_, t) => Text(
+                  show(t),
+                  style: textTheme.headlineSmall?.copyWith(color: scheme.onPrimaryContainer),
                 ),
               ),
             ),
@@ -599,8 +604,7 @@ class _DepartmentBar extends StatelessWidget {
         child: Padding(
           padding: const EdgeInsets.fromLTRB(16, 8, 16, 8),
           // One reveal for the row: the bar grows and the two amounts reading
-          // it fade in together. An amount carries a currency and separators,
-          // so it fades in whole rather than counting up, as the tiles do.
+          // it count up on the same clock, as the tiles do.
           child: Reveal(
             builder: (context, t) => Column(
               crossAxisAlignment: CrossAxisAlignment.start,
@@ -609,10 +613,7 @@ class _DepartmentBar extends StatelessWidget {
                   children: [
                     Expanded(child: Text(name, overflow: TextOverflow.ellipsis)),
                     const SizedBox(width: 8),
-                    Opacity(
-                      opacity: t,
-                      child: Text(amount(total), style: textTheme.titleSmall),
-                    ),
+                    Text(amount(total * t), style: textTheme.titleSmall),
                   ],
                 ),
                 const SizedBox(height: 6),
@@ -636,10 +637,7 @@ class _DepartmentBar extends StatelessWidget {
                   ),
                 ),
                 const SizedBox(height: 4),
-                Opacity(
-                  opacity: t,
-                  child: Text('${amount(paid)} paid', style: textTheme.bodySmall),
-                ),
+                Text('${amount(paid * t)} paid', style: textTheme.bodySmall),
               ],
             ),
           ),

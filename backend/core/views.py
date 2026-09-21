@@ -371,6 +371,9 @@ class CompanyViewSet(viewsets.ModelViewSet):
         return CompanyCreateSerializer if self.action == 'create' else CompanySerializer
 
     def create(self, request, *args, **kwargs):
+        # The link that opens with the company needs a hospital on its other
+        # end, which a superuser standing in no tenant does not have.
+        require_org(request.user)
         serializer = CompanyCreateSerializer(data=request.data, context={'request': request})
         serializer.is_valid(raise_exception=True)
         supplier = serializer.save()
@@ -789,14 +792,19 @@ class ProductViewSet(viewsets.ModelViewSet):
         audit(self.request.user, 'Product', instance.pk, 'DEACTIVATED')
 
     @action(detail=True, methods=['post'])
+    @transaction.atomic
     def restock(self, request, pk=None):
         """Add (or subtract, with a negative value) supplier stock."""
-        product = self.get_object()
         services.require_owner(
-            request.user, product.supplier, 'Only the owning supplier can restock.',
+            request.user, self.get_object().supplier, 'Only the owning supplier can restock.',
         )
+        # The same lock a dispatch takes: two restocks, or a restock and a
+        # dispatch, must not both read the shelf before either has written it.
+        product = Product.objects.select_for_update().get(pk=pk)
         # Signed, so no minimum: a negative figure takes stock back off.
         qty = QuantityField().run_validation(request.data.get('qty'))
+        if qty == 0:
+            raise ValidationError('A restock of zero changes nothing.')
         if product.stock_qty + qty < product.qty_reserved:
             raise ValidationError(
                 f'That would take stock below the {product.qty_reserved} already '
@@ -932,6 +940,11 @@ class RequisitionViewSet(PrintMixin, viewsets.ModelViewSet):
         services.require_owner(self.request.user, instance.hospital, 'Not your requisition.')
         if instance.status != ReqStatus.DRAFT:
             raise ValidationError('Only a draft request can be edited.')
+        # The lines are that company's items, so the draft cannot be pointed
+        # at another one: start a draft for that company instead.
+        supplier = serializer.validated_data.get('supplier')
+        if supplier is not None and supplier.pk != instance.supplier_id:
+            raise ValidationError('A request cannot change its company. Start another one.')
         _check_own_tags(self.request.user, serializer.validated_data, instance)
         # Retagging must not collide with the draft that tag already owns,
         # which the unique constraint would otherwise refuse mid-save.

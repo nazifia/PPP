@@ -305,6 +305,9 @@ class _HomeShellState extends State<HomeShell> {
   Map<int, int> _waiting = const {};
   bool _counting = false;
 
+  /// Bumped to remount the tabs, when what they loaded is known to be stale.
+  int _session = 0;
+
   @override
   void initState() {
     super.initState();
@@ -467,10 +470,10 @@ class _HomeShellState extends State<HomeShell> {
                   ),
                 ),
                 const VerticalDivider(width: 1),
-                Expanded(child: pages[_index]),
+                Expanded(child: KeyedSubtree(key: ValueKey(_session), child: pages[_index])),
               ],
             )
-          : pages[_index],
+          : KeyedSubtree(key: ValueKey(_session), child: pages[_index]),
       bottomNavigationBar: wide
           ? null
           : GlassLayer(
@@ -486,12 +489,17 @@ class _HomeShellState extends State<HomeShell> {
     );
   }
 
-  void _forcePasswordChange(BuildContext context) {
+  Future<void> _forcePasswordChange(BuildContext context) async {
     if (!mounted) return;
-    showDialog<void>(
+    await showDialog<void>(
       context: context,
       barrierDismissible: false,
       builder: (context) => const ChangePasswordDialog(forced: true),
     );
+    // The server refuses everything but the password change until it is
+    // done, so whatever the tab behind the dialog fetched was a refusal.
+    // Remount it, and recount the badges the same fetch would have filled.
+    if (mounted) setState(() => _session++);
+    _count();
   }
 }

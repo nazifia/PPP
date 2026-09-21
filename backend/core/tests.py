@@ -305,6 +305,74 @@ class SupplyFlowTests(APITestCase):
             self.client.get('/api/requisitions/', {'month': 'August'}).status_code, 400,
         )
 
+    def test_a_reset_password_locks_the_api_until_it_is_changed(self):
+        staff = User.objects.create_user(
+            phone='08033333333', password='Sup3rSecret!', full_name='Ward Staff',
+            organization=self.hospital, role=Role.STAFF, must_change_password=True,
+        )
+        self.login(staff.phone)
+        # Enough to see who you are and to fix it; nothing else.
+        self.assertEqual(self.client.get('/api/auth/me/').status_code, 200)
+        self.assertEqual(self.client.get('/api/dashboard/').status_code, 403)
+        self.assertEqual(self.client.get('/api/requisitions/').status_code, 403)
+
+        changed = self.client.post('/api/auth/change-password/', {
+            'current_password': 'Sup3rSecret!', 'new_password': 'An0therSecret!',
+        }, format='json')
+        self.assertEqual(changed.status_code, 200, changed.data)
+        self.client.credentials(HTTP_AUTHORIZATION='Token ' + changed.data['token'])
+        self.assertEqual(self.client.get('/api/dashboard/').status_code, 200)
+
+    def test_a_price_below_zero_and_an_expired_batch_are_refused(self):
+        self.login('08022222222')
+        self.assertEqual(
+            self.client.patch(
+                f'/api/products/{self.product.id}/', {'unit_price': '-1.00'}, format='json',
+            ).status_code,
+            400,
+        )
+        self.assertEqual(
+            self.client.post(
+                f'/api/products/{self.product.id}/restock/', {'qty': 0}, format='json',
+            ).status_code,
+            400,
+        )
+
+        requisition, line = self.submit_request('08011111111', 10)
+        self.login('08022222222')
+        self.client.post(
+            f'/api/requisitions/{requisition}/decide/',
+            {'lines': [{'line': line, 'qty_approved': 10}]}, format='json',
+        )
+        yesterday = (timezone.localdate() - timedelta(days=1)).isoformat()
+        refused = self.client.post(
+            f'/api/requisitions/{requisition}/dispatch/',
+            {'items': [{'line': line, 'qty': 10, 'expiry_date': yesterday}]}, format='json',
+        )
+        self.assertEqual(refused.status_code, 400)
+        self.assertIn('expired', str(refused.data))
+        # Nothing left the shelf on the refusal.
+        self.product.refresh_from_db()
+        self.assertEqual(self.product.stock_qty, 100)
+
+    def test_a_draft_cannot_be_pointed_at_another_company(self):
+        other = Organization.objects.create(
+            name='DCL Lab Products', kind=OrgKind.SUPPLIER, phone='08000000003',
+        )
+        Partnership.objects.create(hospital=self.hospital, supplier=other)
+        self.login('08011111111')
+        draft = self.client.post(
+            '/api/requisitions/wishlist/add/', {'product': self.product.id, 'qty': 2},
+            format='json',
+        ).data
+        moved = self.client.patch(
+            f"/api/requisitions/{draft['id']}/", {'supplier': other.id}, format='json',
+        )
+        self.assertEqual(moved.status_code, 400)
+        self.assertEqual(
+            Requisition.objects.get(pk=draft['id']).supplier_id, self.supplier.id,
+        )
+
     def submit_request(self, phone, qty):
         """Log in as `phone`, wishlist `qty` of the test product and submit it."""
         self.login(phone)
@@ -891,12 +959,15 @@ class SupplyFlowTests(APITestCase):
         balances = reverse('stock-movement-balances')
 
         # Both ends inclusive: the range ending today still holds today's row.
-        today = recent.created_at.date().isoformat()
+        # The ledger filters on the local date, and UTC is an hour behind Lagos.
+        today = timezone.localtime(recent.created_at).date().isoformat()
         windowed = self.client.get(url, {'from': today, 'to': today})
         self.assertEqual(windowed.data['count'], 1)
         self.assertEqual(windowed.data['results'][0]['id'], recent.pk)
         self.assertEqual(
-            self.client.get(url, {'to': long_ago.date().isoformat()}).data['count'], 1,
+            self.client.get(
+                url, {'to': timezone.localtime(long_ago).date().isoformat()},
+            ).data['count'], 1,
         )
 
         self.assertEqual(
@@ -3545,6 +3616,25 @@ class UnitTransferTests(APITestCase):
             201,
         )
         self.assertEqual(self.balance(self.haematology), Decimal('19.0'))
+
+    def test_a_unit_shelf_is_handed_off_only_by_its_own_people(self):
+        self.stock(self.haematology, 20)
+        dispense = {'product': self.product.id, 'qty': 1, 'unit': self.haematology.id}
+        # The unit next door, and somebody nobody has placed, are refused.
+        for user in (self.asker, self.unplaced):
+            self.login(user)
+            refused = self.client.post('/api/stock-movements/dispense/', dispense, format='json')
+            self.assertEqual(refused.status_code, 403, refused.data)
+        # Its own staff, and an administrator, go through.
+        for user in (self.holder, self.admin):
+            self.login(user)
+            self.assertEqual(
+                self.client.post(
+                    '/api/stock-movements/dispense/', dispense, format='json',
+                ).status_code,
+                201,
+            )
+        self.assertEqual(self.balance(self.haematology), Decimal('18.0'))
 
     def test_the_dashboard_counts_what_is_still_waiting_on_somebody(self):
         self.stock(self.haematology, 20)

@@ -399,6 +399,10 @@ class ProductSerializer(serializers.ModelSerializer):
     max_order_qty = QuantityField(min_value=HALF_UNIT, required=False, allow_null=True)
     reorder_level = QuantityField(min_value=Decimal('0'), required=False, allow_null=True)
     is_low_stock = serializers.BooleanField(read_only=True)
+    # Free is a price; owing the buyer is not.
+    unit_price = serializers.DecimalField(
+        max_digits=12, decimal_places=2, min_value=Decimal('0'), required=False,
+    )
 
     class Meta:
         model = Product
