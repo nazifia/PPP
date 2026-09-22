@@ -1025,6 +1025,63 @@ class TransferLine(models.Model):
         return f'{self.product} x{self.qty_requested}'
 
 
+class UnitItem(models.Model):
+    """An item a unit keeps on its own shelf: what it holds, not what it bought.
+
+    The stock ledger only knows goods that arrived on a verified delivery, and
+    only under the supplier's catalogue row. A ward also holds things nobody on
+    the platform sold it — donations, the old stock it opened with, a reagent
+    from another hospital — and this is where those are counted. Unit staff, or
+    an administrator, keep it. It is a count, not a ledger.
+
+    ponytail: qty is edited in place, with the audit trail as the only history.
+    Give it movements when somebody needs to know *why* a figure changed.
+    """
+
+    unit = models.ForeignKey(Unit, on_delete=models.CASCADE, related_name='items')
+    name = models.CharField(max_length=160)
+    brand = models.CharField(max_length=120, blank=True)
+    strength = models.CharField(max_length=60, blank=True)
+    formulation = models.ForeignKey(
+        Formulation, null=True, blank=True, on_delete=models.PROTECT, related_name='unit_items',
+    )
+    dispensing_unit = models.ForeignKey(
+        DispensingUnit, null=True, blank=True, on_delete=models.PROTECT,
+        related_name='unit_items',
+    )
+    qty = quantity_field(default=Decimal('0'))
+    reorder_level = quantity_field(null=True, blank=True)
+    expiry_date = models.DateField(null=True, blank=True)
+    note = models.CharField(max_length=255, blank=True)
+    is_active = models.BooleanField(default=True)
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL,
+        related_name='+',
+    )
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['name', 'strength']
+        constraints = [
+            models.UniqueConstraint(
+                fields=['unit', 'name', 'brand', 'strength'], name='uniq_item_per_unit',
+            ),
+        ]
+
+    def __str__(self):
+        return f'{self.name} {self.strength}'.strip()
+
+    @property
+    def organization_id(self):
+        return self.unit.department.organization_id
+
+    @property
+    def is_low_stock(self):
+        return self.qty < (
+            self.reorder_level if self.reorder_level is not None else DEFAULT_REORDER_LEVEL
+        )
+
+
 class AuditLog(models.Model):
     """Append-only trail. Written by the workflow actions, never edited."""
 

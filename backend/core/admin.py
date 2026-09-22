@@ -24,6 +24,7 @@ from .models import (
     Transfer,
     TransferLine,
     Unit,
+    UnitItem,
     User,
 )
 
@@ -116,7 +117,7 @@ class CreditNoteAdmin(admin.ModelAdmin):
 
 
 admin.site.register(
-    [Partnership, Department, DispensingUnit, Formulation, Unit, StockMovement],
+    [Partnership, Department, DispensingUnit, Formulation, Unit, UnitItem, StockMovement],
 )
 
 

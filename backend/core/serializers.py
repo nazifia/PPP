@@ -35,6 +35,7 @@ from .models import (
     Transfer,
     TransferLine,
     Unit,
+    UnitItem,
     User,
     audit,
     normalize_phone,
@@ -338,6 +339,58 @@ class UnitSerializer(serializers.ModelSerializer):
     class Meta:
         model = Unit
         fields = ['id', 'name', 'full_name', 'department', 'department_name', 'is_active']
+
+
+class UnitItemSerializer(serializers.ModelSerializer):
+    unit_name = serializers.CharField(source='unit.__str__', read_only=True)
+    department = serializers.IntegerField(source='unit.department_id', read_only=True)
+    formulation_name = serializers.CharField(source='formulation.name', read_only=True, default='')
+    dispensing_unit_name = serializers.CharField(
+        source='dispensing_unit.name', read_only=True, default='',
+    )
+    qty = QuantityField(min_value=Decimal('0'), required=False)
+    reorder_level = QuantityField(min_value=Decimal('0'), required=False, allow_null=True)
+    is_low_stock = serializers.BooleanField(read_only=True)
+
+    class Meta:
+        model = UnitItem
+        fields = [
+            'id', 'unit', 'unit_name', 'department', 'name', 'brand', 'strength',
+            'formulation', 'formulation_name', 'dispensing_unit', 'dispensing_unit_name',
+            'qty', 'reorder_level', 'is_low_stock', 'expiry_date', 'note', 'is_active',
+            'updated_at',
+        ]
+        # As on ProductSerializer: the constraint's validator would make brand
+        # and strength mandatory. `validate` below states it instead.
+        validators = []
+
+    def _check_term(self, term):
+        # Same rule as the catalogue: no company's private term, nothing retired.
+        if term is None:
+            return term
+        user = self.context['request'].user
+        if not visible_terms(user, type(term)).filter(pk=term.pk).exists():
+            raise serializers.ValidationError('That belongs to another company.')
+        if not term.is_active:
+            raise serializers.ValidationError(f'{term.name} has been retired.')
+        return term
+
+    validate_formulation = _check_term
+    validate_dispensing_unit = _check_term
+
+    def validate(self, attrs):
+        # The unique constraint, stated in words.
+        instance = self.instance
+        key = {
+            field: attrs.get(field, getattr(instance, field, '' if field != 'unit' else None))
+            for field in ('unit', 'name', 'brand', 'strength')
+        }
+        clash = UnitItem.objects.filter(**key)
+        if instance is not None:
+            clash = clash.exclude(pk=instance.pk)
+        if clash.exists():
+            raise serializers.ValidationError({'name': 'This unit already lists that item.'})
+        return attrs
 
 
 def visible_terms(user, model):

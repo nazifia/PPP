@@ -8,6 +8,7 @@ router.register('companies', views.CompanyViewSet, basename='company')
 router.register('users', views.UserViewSet, basename='user')
 router.register('departments', views.DepartmentViewSet, basename='department')
 router.register('units', views.UnitViewSet, basename='unit')
+router.register('unit-items', views.UnitItemViewSet, basename='unit-item')
 router.register(
     'dispensing-units', views.DispensingUnitViewSet, basename='dispensing-unit',
 )

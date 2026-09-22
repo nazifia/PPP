@@ -63,6 +63,7 @@ from .models import (
     Transfer,
     TransferStatus,
     Unit,
+    UnitItem,
     User,
     audit,
     normalize_phone,
@@ -103,6 +104,7 @@ from .serializers import (
     TransferReceiveSerializer,
     TransferRequestSerializer,
     TransferSerializer,
+    UnitItemSerializer,
     UnitSerializer,
     UserCreateSerializer,
     UserSerializer,
@@ -600,13 +602,13 @@ def check_unit_is_empty(unit):
     the unit is what stops new work being filed under it; this only stops the
     row being destroyed while it still means something.
     """
-    held = StockMovement.objects.filter(unit=unit).exists()
+    held = StockMovement.objects.filter(unit=unit).exists() or unit.items.exists()
     open_transfers = Transfer.objects.filter(
         Q(from_unit=unit) | Q(to_unit=unit), status__in=TRANSFER_OPEN_STATUSES,
     ).exists()
     if held or open_transfers:
         raise ValidationError(
-            f'{unit} still has stock movements or open transfers against it. '
+            f'{unit} still has stock, items or open transfers against it. '
             f'Retire it instead, which stops new work being filed under it.'
         )
 
@@ -651,6 +653,69 @@ class UnitViewSet(viewsets.ModelViewSet):
     def perform_destroy(self, instance):
         services.require_owner(self.request.user, instance.department.organization)
         check_unit_is_empty(instance)
+        instance.delete()
+
+
+class UnitItemViewSet(viewsets.ModelViewSet):
+    """What each unit keeps on its own shelf. `?unit=` or `?department=` narrows.
+
+    Every member of the hospital reads the lot, as with the ledger, so a ward
+    can see what the one next door holds before asking. Changing a shelf is for
+    the people standing at it, or an administrator: the same rule a transfer
+    and a dispense answer to.
+    """
+
+    serializer_class = UnitItemSerializer
+    permission_classes = [IsAuthenticated, IsHospital]
+    filter_backends = [filters.SearchFilter]
+    search_fields = ['name', 'brand', 'strength', 'unit__name', 'unit__department__name']
+
+    def get_queryset(self):
+        user = self.request.user
+        queryset = UnitItem.objects.filter(
+            **org_scope(user, unit__department__organization=user.scope_org),
+        ).select_related('unit__department', 'formulation', 'dispensing_unit')
+        params = self.request.query_params
+        for param, clause in (('unit', 'unit_id'), ('department', 'unit__department_id')):
+            value = params.get(param)
+            if value:
+                queryset = queryset.filter(**{clause: value})
+        if params.get('active') == 'true':
+            queryset = queryset.filter(is_active=True)
+        return queryset
+
+    def _check_shelf(self, unit):
+        services.require_own_unit(self.request.user, unit)
+        services.require_unit_member(self.request.user, unit, 'change its items')
+
+    def perform_create(self, serializer):
+        require_org(self.request.user)
+        self._check_shelf(serializer.validated_data['unit'])
+        item = serializer.save(created_by=self.request.user)
+        audit(self.request.user, 'UnitItem', item.pk, 'CREATED', item=str(item), unit=str(item.unit))
+
+    def perform_update(self, serializer):
+        item = serializer.instance
+        services.require_owner(self.request.user, item.unit.department.organization)
+        self._check_shelf(item.unit)
+        # Moving it to another shelf needs the say-so of that shelf too.
+        target = serializer.validated_data.get('unit')
+        if target is not None and target.pk != item.unit_id:
+            self._check_shelf(target)
+        before = item.qty
+        item = serializer.save()
+        audit(
+            self.request.user, 'UnitItem', item.pk, 'UPDATED',
+            item=str(item), unit=str(item.unit), qty_before=before, qty_after=item.qty,
+        )
+
+    def perform_destroy(self, instance):
+        services.require_owner(self.request.user, instance.unit.department.organization)
+        self._check_shelf(instance.unit)
+        audit(
+            self.request.user, 'UnitItem', instance.pk, 'DELETED',
+            item=str(instance), unit=str(instance.unit), qty=instance.qty,
+        )
         instance.delete()
 
 
@@ -1600,7 +1665,7 @@ class TransferViewSet(
     def cancel(self, request, pk=None):
         """The asking unit withdraws it before anyone answers."""
         transfer = services.cancel_transfer(
-            self.get_object(), request.user, request.data.get('reason', ''),
+            self.get_object(), request.user, str(request.data.get('reason') or ''),
         )
         return Response(TransferSerializer(transfer).data)
 

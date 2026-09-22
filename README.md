@@ -59,6 +59,17 @@ that carries it stays editable, and it keeps its place in the list so it can be 
 back. The dispensing units and formulations work the same way — a retired term describes no
 new item, and the items already described by it keep it.
 
+A unit also keeps its own shelf list, `/api/unit-items/`: the medications, reagents and
+consumables it holds regardless of where they came from — donations, opening stock, anything
+nobody on the platform sold it. Each row names the item (name, brand, strength, form,
+dispensing unit), a quantity, an optional reorder level and expiry date. Every member of the
+hospital reads every unit's list (`?unit=` or `?department=` narrows it, `?search=` matches
+the name); adding, editing or deleting a row takes the unit's own staff or an administrator,
+the same rule a transfer and a dispense answer to, and moving a row onto another unit's shelf
+needs the say-so of that unit too. A unit still listing items cannot be deleted, only retired.
+This is a count, not a ledger: the quantity is edited in place, and the audit trail is its
+only history.
+
 An organisation administrator opens the accounts inside it, edits any detail of one —
 name, phone, email, job title and role, between `ADMIN` and `STAFF` — resets a forgotten
 password (held to the same validators as sign-up, and the owner must change it at next login —

@@ -28,6 +28,7 @@ from .models import (
     DeliveryStatus,
     Department,
     DispensingUnit,
+    Formulation,
     Invoice,
     InvoiceStatus,
     OrgKind,
@@ -43,6 +44,7 @@ from .models import (
     Role,
     StockMovement,
     Unit,
+    UnitItem,
     User,
 )
 
@@ -3680,3 +3682,97 @@ class UnitTransferTests(APITestCase):
         )
         self.assertIn('Shelf', ledger_text)
         self.assertIn('HAEMATOLOGY', ledger_text)
+
+
+class UnitItemTests(APITestCase):
+    """A unit keeping count of its own shelf.
+
+    Borrows the transfer fixture: two units in one department, a member of
+    each, an administrator, and somebody placed on no unit at all.
+    """
+
+    setUp = UnitTransferTests.setUp
+    login = UnitTransferTests.login
+
+    def item(self, unit=None, **extra):
+        payload = {'unit': (unit or self.haematology).id, 'name': 'Giemsa stain', 'qty': 4}
+        payload.update(extra)
+        return self.client.post('/api/unit-items/', payload, format='json')
+
+    def test_unit_staff_keep_their_own_shelf(self):
+        self.login(self.holder)
+        created = self.item(strength='500ml', formulation=Formulation.objects.get(
+            supplier=None, name='SOLUTION',
+        ).id)
+        self.assertEqual(created.status_code, 201, created.data)
+        item_id = created.data['id']
+        self.assertEqual(created.data['unit_name'], 'LABORATORY / HAEMATOLOGY')
+        self.assertEqual(created.data['formulation_name'], 'SOLUTION')
+        self.assertTrue(created.data['is_low_stock'])
+
+        # Same name twice on one shelf is one row nobody can total.
+        self.assertEqual(self.item(strength='500ml').status_code, 400)
+
+        edited = self.client.patch(
+            f'/api/unit-items/{item_id}/', {'qty': 12, 'reorder_level': 2}, format='json',
+        )
+        self.assertEqual(edited.status_code, 200, edited.data)
+        self.assertEqual(edited.data['qty'], Decimal('12.0'))
+        self.assertFalse(edited.data['is_low_stock'])
+
+        # The neighbouring unit reads it, but may not touch it.
+        self.login(self.asker)
+        listed = self.client.get(f'/api/unit-items/?unit={self.haematology.id}')
+        self.assertEqual([row['id'] for row in listed.data['results']], [item_id])
+        self.assertEqual(
+            self.client.patch(f'/api/unit-items/{item_id}/', {'qty': 0}, format='json').status_code,
+            403,
+        )
+        self.assertEqual(self.client.delete(f'/api/unit-items/{item_id}/').status_code, 403)
+        self.assertEqual(self.item().status_code, 403)
+        # Nor may it pull the item onto its own shelf.
+        self.login(self.holder)
+        self.assertEqual(
+            self.client.patch(
+                f'/api/unit-items/{item_id}/', {'unit': self.chemistry.id}, format='json',
+            ).status_code,
+            403,
+        )
+
+        # Somebody placed on no unit cannot write anywhere; an administrator can.
+        self.login(self.unplaced)
+        self.assertEqual(self.item(name='Other').status_code, 403)
+        self.login(self.admin)
+        self.assertEqual(self.item(self.chemistry, name='Other').status_code, 201)
+        trail = AuditLog.objects.filter(entity='UnitItem').values_list('action', flat=True)
+        self.assertEqual(sorted(trail), ['CREATED', 'CREATED', 'UPDATED'])
+        self.assertEqual(self.client.delete(f'/api/unit-items/{item_id}/').status_code, 204)
+        self.assertFalse(UnitItem.objects.filter(pk=item_id).exists())
+
+    def test_another_hospital_sees_nothing_and_a_supplier_is_kept_out(self):
+        UnitItem.objects.create(unit=self.haematology, name='Giemsa stain', qty=4)
+        other = Organization.objects.create(
+            name='Other Hospital', kind=OrgKind.HOSPITAL, phone='08000000009',
+        )
+        outsider = User.objects.create_user(
+            phone='08099999999', password='Sup3rSecret!', full_name='Outsider',
+            organization=other, role=Role.ADMIN,
+        )
+        self.login(outsider)
+        self.assertEqual(self.client.get('/api/unit-items/').data['count'], 0)
+        # Naming a unit of another hospital is refused, not silently adopted.
+        self.assertEqual(self.item().status_code, 400)
+
+        seller = User.objects.create_user(
+            phone='08088888888', password='Sup3rSecret!', full_name='Seller',
+            organization=self.supplier, role=Role.ADMIN,
+        )
+        self.login(seller)
+        self.assertEqual(self.client.get('/api/unit-items/').status_code, 403)
+
+    def test_a_unit_holding_items_cannot_be_deleted(self):
+        UnitItem.objects.create(unit=self.haematology, name='Giemsa stain', qty=4)
+        self.login(self.admin)
+        gone = self.client.delete(f'/api/units/{self.haematology.id}/')
+        self.assertEqual(gone.status_code, 400, gone.data)
+        self.assertTrue(Unit.objects.filter(pk=self.haematology.pk).exists())

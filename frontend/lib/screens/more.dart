@@ -7,6 +7,7 @@ import '../ui.dart';
 import 'deliveries.dart';
 import 'login.dart';
 import 'transfers.dart';
+import 'unit_items.dart';
 
 /// What the server accepts as a payment receipt. Kept in step with
 /// `RECEIPT_EXTENSIONS` and `RECEIPT_MAX_BYTES` in core/models.py.
@@ -118,6 +119,14 @@ class MoreScreen extends StatelessWidget {
                 title: const Text('Unit transfers'),
                 subtitle: const Text('Borrow stock from another unit of your department'),
                 onTap: () => open(const TransfersScreen()),
+              ),
+            // A unit's own count of its shelf, whoever the goods came from.
+            if (api.canActAsHospital)
+              ListTile(
+                leading: const Icon(Icons.medication_outlined),
+                title: const Text('Unit items'),
+                subtitle: const Text('What each unit keeps on its shelf'),
+                onTap: () => open(const UnitItemsScreen()),
               ),
             // A supplier's stock carries no expiry date until it is delivered,
             // so the shelf check belongs to whoever is holding the shelf.
@@ -932,7 +941,7 @@ class _UserDialogState extends State<_UserDialog> {
               ),
               // Draws nothing where the organisation keeps no units, which is
               // every supplier and any hospital that has not divided itself up.
-              _UnitField(
+              UnitField(
                 label: 'Unit',
                 placeholder: 'No particular unit',
                 value: _unit,
@@ -2112,7 +2121,7 @@ class _StockLedgerScreenState extends State<StockLedgerScreen> {
           Bounded(
             child: Padding(
               padding: const EdgeInsets.symmetric(horizontal: 12),
-              child: _UnitField(
+              child: UnitField(
                 placeholder: 'Anywhere',
                 extras: const {'store': 'Organisation store'},
                 padding: EdgeInsets.zero,
@@ -2238,8 +2247,9 @@ List<DropdownMenuEntry<Object?>> _balanceEntries(
 /// Whose shelf a movement is recorded against: one unit's, or the
 /// organisation's own store. Draws nothing where the organisation keeps no
 /// units, since then there is only ever the store.
-class _UnitField extends StatefulWidget {
-  const _UnitField({
+class UnitField extends StatefulWidget {
+  const UnitField({
+    super.key,
     required this.value,
     required this.onSelected,
     this.label = 'Shelf',
@@ -2263,10 +2273,10 @@ class _UnitField extends StatefulWidget {
   final EdgeInsetsGeometry padding;
 
   @override
-  State<_UnitField> createState() => _UnitFieldState();
+  State<UnitField> createState() => UnitFieldState();
 }
 
-class _UnitFieldState extends State<_UnitField> {
+class UnitFieldState extends State<UnitField> {
   Future<List<Map<String, dynamic>>>? _units;
 
   @override
@@ -2401,7 +2411,7 @@ class _DispenseDialogState extends State<_DispenseDialog> {
               child: Column(
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  _UnitField(value: _unit, onSelected: _pickUnit),
+                  UnitField(value: _unit, onSelected: _pickUnit),
                   const SizedBox(height: 12),
                   if (stocked.isEmpty)
                     const Text('Nothing on that shelf to dispense.')
@@ -2550,7 +2560,7 @@ class _AdjustDialogState extends State<_AdjustDialog> {
               child: Column(
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  _UnitField(value: _unit, onSelected: _pickUnit),
+                  UnitField(value: _unit, onSelected: _pickUnit),
                   const SizedBox(height: 12),
                   if (rows.isEmpty)
                     const Text('Nothing has been received on that shelf yet.')
