@@ -37,8 +37,12 @@ Demo accounts (`seed_demo`), all with password `Passw0rd!2026`:
 ## How the tenancy works
 
 One `Organization` table holds both kinds of tenant, told apart by `kind`:
-`HOSPITAL` or `SUPPLIER`. A user belongs to exactly one organisation and is either
-`ADMIN` or `STAFF` within it.
+`HOSPITAL` or `SUPPLIER`. A user belongs to exactly one organisation and is `ADMIN`,
+`UNIT_ADMIN` or `STAFF` within it. A `UNIT_ADMIN` runs the one unit its account is placed
+on (the role is refused without one): it opens `STAFF` accounts there, edits, resets and
+disables them, and corrects that shelf's ledger with `adjust/`. Nothing past the unit —
+not another unit's people, not the store, and never a role above staff, so it cannot
+promote its way out.
 
 Suspending an organisation (`is_active`) shuts it out at once, not at the next login: the
 sessions already open are cut on their next request, however the suspension was made — the

@@ -70,6 +70,9 @@ class OrgCategory(models.TextChoices):
 
 class Role(models.TextChoices):
     ADMIN = 'ADMIN', 'Administrator'
+    #: Runs one unit: its shelf, its people, and nothing outside it. Needs a
+    #: `unit` on the account to mean anything.
+    UNIT_ADMIN = 'UNIT_ADMIN', 'Unit administrator'
     STAFF = 'STAFF', 'Staff'
 
 
@@ -154,7 +157,7 @@ class User(AbstractBaseUser, PermissionsMixin):
     organization = models.ForeignKey(
         Organization, null=True, blank=True, on_delete=models.CASCADE, related_name='users',
     )
-    role = models.CharField(max_length=8, choices=Role.choices, default=Role.STAFF)
+    role = models.CharField(max_length=12, choices=Role.choices, default=Role.STAFF)
     #: Which unit this account works on, where the organisation is divided that
     #: far. It is what says whose shelf a person may hand stock off, so a
     #: transfer between two units answers to the people standing at each of
@@ -212,6 +215,15 @@ class User(AbstractBaseUser, PermissionsMixin):
     def is_org_admin(self):
         # A platform superuser outranks every organisation administrator.
         return self.is_superuser or self.role == Role.ADMIN
+
+    @property
+    def is_unit_admin(self):
+        """Runs the unit on the account. Placed on none, the title is empty."""
+        return self.role == Role.UNIT_ADMIN and self.unit_id is not None
+
+    def runs_unit(self, unit_id):
+        """May this account act as an administrator for that unit's shelf and people?"""
+        return self.is_org_admin or (self.is_unit_admin and self.unit_id == unit_id)
 
     @property
     def org_kind(self):

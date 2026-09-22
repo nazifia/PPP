@@ -96,6 +96,11 @@ class Api extends ChangeNotifier {
   bool get isHospital => orgKind == 'HOSPITAL';
   bool get isSupplier => orgKind == 'SUPPLIER';
   bool get isAdmin => user?['role'] == 'ADMIN';
+  bool get isUnitAdmin => user?['role'] == 'UNIT_ADMIN' && unitId != null;
+
+  /// May this account act as an administrator for [unit]: an organisation
+  /// administrator anywhere, a unit administrator on its own unit only.
+  bool runsUnit(int? unit) => isAdmin || isSuperuser || (isUnitAdmin && unitId == unit);
   bool get isSuperuser => user?['is_superuser'] == true;
 
   /// The unit this account works on, where the hospital is divided that far.

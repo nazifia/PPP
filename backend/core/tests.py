@@ -3849,3 +3849,99 @@ class UnitItemTests(APITestCase):
         gone = self.client.delete(f'/api/units/{self.haematology.id}/')
         self.assertEqual(gone.status_code, 400, gone.data)
         self.assertTrue(Unit.objects.filter(pk=self.haematology.pk).exists())
+
+
+class UnitAdminTests(APITestCase):
+    """A unit administrator runs one unit: its people and its shelf, nothing past it."""
+
+    setUp = UnitTransferTests.setUp
+    login = UnitTransferTests.login
+    stock = UnitTransferTests.stock
+
+    def head(self):
+        return User.objects.create_user(
+            phone='08077777777', password='Sup3rSecret!', full_name='Haematology Head',
+            organization=self.hospital, role=Role.UNIT_ADMIN, unit=self.haematology,
+        )
+
+    def test_a_unit_administrator_must_be_placed_on_a_unit(self):
+        self.login(self.admin)
+        response = self.client.post('/api/users/', {
+            'phone': '08088888888', 'full_name': 'Nobody', 'role': 'UNIT_ADMIN',
+            'password': 'Sup3rSecret!',
+        }, format='json')
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('unit', response.data)
+        response = self.client.patch(
+            f'/api/users/{self.holder.id}/', {'role': 'UNIT_ADMIN'}, format='json',
+        )
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(
+            self.client.patch(f'/api/users/{self.holder.id}/', {'unit': None}, format='json')
+            .status_code, 400,
+        )
+
+    def test_keeps_its_own_people_and_nobody_else(self):
+        self.login(self.head())
+        # Opens staff on its own unit; the unit is pinned whatever was sent.
+        created = self.client.post('/api/users/', {
+            'phone': '08088888888', 'full_name': 'New Hand', 'password': 'Sup3rSecret!',
+            'unit': self.chemistry.id,
+        }, format='json')
+        self.assertEqual(created.status_code, 403, created.data)
+        created = self.client.post('/api/users/', {
+            'phone': '08088888888', 'full_name': 'New Hand', 'password': 'Sup3rSecret!',
+        }, format='json')
+        self.assertEqual(created.status_code, 201, created.data)
+        self.assertEqual(created.data['unit'], self.haematology.id)
+        self.assertEqual(created.data['role'], 'STAFF')
+        # No promoting anybody.
+        self.assertEqual(self.client.post('/api/users/', {
+            'phone': '08099999999', 'full_name': 'Rival', 'password': 'Sup3rSecret!',
+            'role': 'ADMIN',
+        }, format='json').status_code, 403)
+        self.assertEqual(self.client.patch(
+            f'/api/users/{self.holder.id}/', {'role': 'UNIT_ADMIN'}, format='json',
+        ).status_code, 403)
+        # Own unit's staff: edit, reset, disable. Others: none of it.
+        self.assertEqual(self.client.patch(
+            f'/api/users/{self.holder.id}/', {'job_title': 'Scientist'}, format='json',
+        ).status_code, 200)
+        self.assertEqual(self.client.post(
+            f'/api/users/{self.holder.id}/reset_password/', {'new_password': 'An0therSecret!'},
+            format='json',
+        ).status_code, 200)
+        self.assertEqual(self.client.delete(f'/api/users/{self.holder.id}/').status_code, 204)
+        for other in (self.asker, self.unplaced, self.admin):
+            self.assertEqual(self.client.patch(
+                f'/api/users/{other.id}/', {'job_title': 'X'}, format='json',
+            ).status_code, 403, other)
+            self.assertEqual(self.client.delete(f'/api/users/{other.id}/').status_code, 403)
+            self.assertEqual(self.client.post(
+                f'/api/users/{other.id}/reset_password/', {'new_password': 'An0therSecret!'},
+                format='json',
+            ).status_code, 403)
+        # Plain staff still cannot open accounts at all.
+        self.login(self.asker)
+        self.assertEqual(self.client.post('/api/users/', {
+            'phone': '08000000099', 'full_name': 'X', 'password': 'Sup3rSecret!',
+        }, format='json').status_code, 403)
+
+    def test_corrects_its_own_shelf_only(self):
+        self.stock(self.haematology, 10)
+        self.stock(self.chemistry, 10)
+        self.stock(None, 10)
+        self.login(self.head())
+        adjust = lambda **body: self.client.post('/api/stock-movements/adjust/', {
+            'product': self.product.id, 'qty': -2, 'reason': 'Broken', **body,
+        }, format='json')
+        self.assertEqual(adjust(unit=self.haematology.id).status_code, 201)
+        self.assertEqual(adjust(unit=self.chemistry.id).status_code, 403)
+        self.assertEqual(adjust().status_code, 403)
+        # The shelf list follows the ledger, as it does for everyone.
+        self.assertEqual(self.client.post('/api/unit-items/', {
+            'unit': self.chemistry.id, 'name': 'Giemsa', 'qty': 1,
+        }, format='json').status_code, 403)
+        self.assertEqual(self.client.post('/api/unit-items/', {
+            'unit': self.haematology.id, 'name': 'Giemsa', 'qty': 1,
+        }, format='json').status_code, 201)

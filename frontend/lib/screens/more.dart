@@ -770,7 +770,7 @@ class _UsersScreenState extends State<UsersScreen> {
     final api = ApiScope.of(context);
     return Scaffold(
       appBar: AppBar(title: const Text('Staff accounts')),
-      floatingActionButton: api.isAdmin
+      floatingActionButton: api.isAdmin || api.isUnitAdmin
           ? FloatingActionButton.extended(
               onPressed: () async {
                 final added = await showDialog<bool>(
@@ -814,7 +814,11 @@ class _UsersScreenState extends State<UsersScreen> {
                           '${'${user['unit_name'] ?? ''}'.isEmpty ? '' : ' · ${user['unit_name']}'}'
                           '${user['is_active'] == true ? '' : ' · disabled'}',
                         ),
-                        trailing: api.isAdmin
+                        // A unit administrator keeps only the staff on its own unit.
+                        trailing: api.isAdmin ||
+                                (api.isUnitAdmin &&
+                                    user['role'] == 'STAFF' &&
+                                    user['unit'] == api.unitId)
                             ? PopupMenuButton<String>(
                                 onSelected: (choice) async {
                                   try {
@@ -940,23 +944,28 @@ class _UserDialogState extends State<_UserDialog> {
                     ),
                   ),
                 ),
-              PickerField<String?>(
-                label: 'Role',
-                value: _role,
-                entries: const [
-                  DropdownMenuEntry(value: 'STAFF', label: 'Staff'),
-                  DropdownMenuEntry(value: 'ADMIN', label: 'Administrator'),
-                ],
-                onSelected: (value) => setState(() => _role = value ?? 'STAFF'),
-              ),
-              // Draws nothing where the organisation keeps no units, which is
-              // every supplier and any hospital that has not divided itself up.
-              UnitField(
-                label: 'Unit',
-                placeholder: 'No particular unit',
-                value: _unit,
-                onSelected: (value) => setState(() => _unit = value),
-              ),
+              // A unit administrator opens staff on its own unit and nothing
+              // else, so neither the role nor the unit is its to pick.
+              if (ApiScope.of(context).isAdmin || ApiScope.of(context).isSuperuser) ...[
+                PickerField<String?>(
+                  label: 'Role',
+                  value: _role,
+                  entries: const [
+                    DropdownMenuEntry(value: 'STAFF', label: 'Staff'),
+                    DropdownMenuEntry(value: 'UNIT_ADMIN', label: 'Unit administrator'),
+                    DropdownMenuEntry(value: 'ADMIN', label: 'Administrator'),
+                  ],
+                  onSelected: (value) => setState(() => _role = value ?? 'STAFF'),
+                ),
+                // Draws nothing where the organisation keeps no units, which is
+                // every supplier and any hospital that has not divided itself up.
+                UnitField(
+                  label: 'Unit',
+                  placeholder: 'No particular unit',
+                  value: _unit,
+                  onSelected: (value) => setState(() => _unit = value),
+                ),
+              ],
             ],
           ),
         ),
@@ -976,9 +985,11 @@ class _UserDialogState extends State<_UserDialog> {
                   setState(() => _busy = true);
                   final body = <String, dynamic>{
                     for (final entry in _fields.entries) entry.key: entry.value.text.trim(),
-                    'role': _role,
-                    // Null clears it: an account taken off a unit acts for none.
-                    'unit': _unit.isEmpty ? null : int.parse(_unit),
+                    if (api.isAdmin || api.isSuperuser) ...{
+                      'role': _role,
+                      // Null clears it: an account taken off a unit acts for none.
+                      'unit': _unit.isEmpty ? null : int.parse(_unit),
+                    },
                     ...org,
                   };
                   try {
@@ -2112,7 +2123,8 @@ class _StockLedgerScreenState extends State<StockLedgerScreen> {
           // something off the shelf comes through here, and it answers to an
           // administrator because it is the one way stock moves without a
           // delivery or a ward behind it.
-          if (ApiScope.of(context).canActAsHospital && ApiScope.of(context).isAdmin)
+          if (ApiScope.of(context).canActAsHospital &&
+              (ApiScope.of(context).isAdmin || ApiScope.of(context).isUnitAdmin))
             IconButton(
               icon: const Icon(Icons.edit_note),
               tooltip: 'Adjust stock',
@@ -2548,8 +2560,10 @@ class _AdjustDialogState extends State<_AdjustDialog> {
     // Every item the shelf has ever heard of, including the ones it has run
     // down to nothing: a miscount is corrected upwards as often as down. An
     // item with no history at all is one this hospital never received, and the
-    // server refuses it.
-    _held = _balances(ApiScope.read(context), unit: 'store');
+    // server refuses it. A unit administrator corrects its own shelf only.
+    final api = ApiScope.read(context);
+    if (api.isUnitAdmin) _unit = '${api.unitId}';
+    _held = _balances(api, unit: _unit.isEmpty ? 'store' : _unit);
   }
 
   void _pickUnit(String unit) => setState(() {
@@ -2615,7 +2629,8 @@ class _AdjustDialogState extends State<_AdjustDialog> {
               child: Column(
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  UnitField(value: _unit, onSelected: _pickUnit),
+                  if (!ApiScope.of(context).isUnitAdmin)
+                    UnitField(value: _unit, onSelected: _pickUnit),
                   const SizedBox(height: 12),
                   if (rows.isEmpty)
                     const Text('Nothing has been received on that shelf yet.')

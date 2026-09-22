@@ -166,6 +166,14 @@ class IsOrgAdmin(BasePermission):
         return bool(request.user.is_authenticated and request.user.is_org_admin)
 
 
+class IsOrgOrUnitAdmin(BasePermission):
+    message = 'Only an organisation or unit administrator can do this.'
+
+    def has_permission(self, request, view):
+        user = request.user
+        return bool(user.is_authenticated and (user.is_org_admin or user.is_unit_admin))
+
+
 class IsHospital(BasePermission):
     message = 'Only hospital users can do this.'
 
@@ -484,6 +492,9 @@ class UserViewSet(viewsets.ModelViewSet):
 
     def perform_create(self, serializer):
         require_org(self.request.user)
+        self._check_unit_admin(data=serializer.validated_data)
+        if not self.request.user.is_org_admin:
+            serializer.validated_data['unit'] = self.request.user.unit
         serializer.save()
 
     def get_permissions(self):
@@ -492,8 +503,28 @@ class UserViewSet(viewsets.ModelViewSet):
         # staff — who could then reset an administrator's password and log in
         # as them.
         if self.action in WRITE_ACTIONS + ('reset_password',):
-            return [IsAuthenticated(), IsOrgAdmin()]
+            return [IsAuthenticated(), IsOrgOrUnitAdmin()]
         return [IsAuthenticated()]
+
+    def _check_unit_admin(self, instance=None, data=None):
+        """A unit administrator opens and keeps staff accounts on its own unit.
+
+        Nothing outside it: not another unit's people, not an account on no
+        unit, and never a role above staff — which would be a road to promoting
+        itself out of the unit.
+        """
+        actor = self.request.user
+        if actor.is_org_admin:
+            return
+        data = data or {}
+        if instance is not None and instance.unit_id != actor.unit_id:
+            raise PermissionDenied('A unit administrator only manages accounts on its own unit.')
+        if instance is not None and instance.role != Role.STAFF:
+            raise PermissionDenied('A unit administrator only manages staff accounts.')
+        if data.get('role', Role.STAFF) != Role.STAFF:
+            raise PermissionDenied('A unit administrator can only open staff accounts.')
+        if 'unit' in data and (data['unit'] is None or data['unit'].pk != actor.unit_id):
+            raise PermissionDenied('A unit administrator only places accounts on its own unit.')
 
     @staticmethod
     def _is_last_admin(instance):
@@ -512,6 +543,7 @@ class UserViewSet(viewsets.ModelViewSet):
     def perform_update(self, serializer):
         instance = serializer.instance
         data = serializer.validated_data
+        self._check_unit_admin(instance, data)
         # Checked before the save, so a refusal leaves the row untouched.
         steps_down = (
             data.get('role', instance.role) != Role.ADMIN
@@ -533,6 +565,7 @@ class UserViewSet(viewsets.ModelViewSet):
     def perform_destroy(self, instance):
         if instance == self.request.user:
             raise ValidationError('You cannot disable your own account.')
+        self._check_unit_admin(instance)
         if self._is_last_admin(instance):
             raise ValidationError(
                 'This is the only administrator left. Promote someone else first.'
@@ -542,9 +575,10 @@ class UserViewSet(viewsets.ModelViewSet):
         Token.objects.filter(user=instance).delete()
         audit(self.request.user, 'User', instance.pk, 'DISABLED')
 
-    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated, IsOrgAdmin])
+    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated, IsOrgOrUnitAdmin])
     def reset_password(self, request, pk=None):
         user = self.get_object()
+        self._check_unit_admin(user)
         new_password = request.data.get('new_password') or ''
         # The same validators sign-up and change-password run. A reset is the
         # one password path an administrator picks for somebody else, which is
@@ -1484,7 +1518,7 @@ class StockMovementViewSet(PrintListMixin, viewsets.ReadOnlyModelViewSet):
         movement = services.dispense(request.user, **serializer.validated_data)
         return Response(StockMovementSerializer(movement).data, status=status.HTTP_201_CREATED)
 
-    @action(detail=False, methods=['post'], permission_classes=[IsAuthenticated, IsOrgAdmin])
+    @action(detail=False, methods=['post'], permission_classes=[IsAuthenticated, IsOrgOrUnitAdmin])
     def adjust(self, request):
         """A hospital writes stock off, or puts a miscount right. Signed."""
         serializer = AdjustSerializer(data=request.data)

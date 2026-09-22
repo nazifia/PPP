@@ -168,8 +168,10 @@ def adjust(user, product, qty, reason, unit=None):
     never comes back. The supplier's half of this is `restock` on the catalogue.
     """
     require_hospital(user)
-    if not user.is_org_admin:
-        raise PermissionDenied('Only an organisation administrator can adjust the ledger.')
+    # A unit administrator corrects its own shelf; the store and every other
+    # shelf stay with the organisation's administrators.
+    if not user.runs_unit(unit.pk if unit is not None else None):
+        raise PermissionDenied('Only an administrator can adjust this ledger.')
     if qty == 0:
         raise ValidationError('An adjustment of zero changes nothing.')
     if not (reason or '').strip():

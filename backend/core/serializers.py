@@ -120,6 +120,15 @@ def own_unit(user, unit):
     return unit
 
 
+def unit_admin_has_unit(attrs, instance=None):
+    """A unit administrator runs a unit, so the account must name one."""
+    role = attrs.get('role', getattr(instance, 'role', None))
+    unit = attrs['unit'] if 'unit' in attrs else getattr(instance, 'unit_id', None)
+    if role == Role.UNIT_ADMIN and unit is None:
+        raise serializers.ValidationError({'unit': 'A unit administrator must be placed on a unit.'})
+    return attrs
+
+
 class UserSerializer(serializers.ModelSerializer):
     # scope_org rather than organization, so a superuser acting inside a tenant
     # is reported as that tenant. For everyone else the two are the same.
@@ -144,6 +153,9 @@ class UserSerializer(serializers.ModelSerializer):
 
     def validate_unit(self, value):
         return own_unit(self.context['request'].user, value)
+
+    def validate(self, attrs):
+        return unit_admin_has_unit(attrs, self.instance)
 
     def validate_phone(self, value):
         # The model normalises on the way into the database, so the clash has to
@@ -173,6 +185,9 @@ class UserCreateSerializer(serializers.ModelSerializer):
 
     def validate_unit(self, value):
         return own_unit(self.context['request'].user, value)
+
+    def validate(self, attrs):
+        return unit_admin_has_unit(attrs)
 
     def create(self, validated):
         password = validated.pop('password')
