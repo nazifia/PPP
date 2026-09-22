@@ -2256,7 +2256,12 @@ class UnitField extends StatefulWidget {
     this.placeholder = 'Organisation store',
     this.extras = const {},
     this.padding = const EdgeInsets.only(top: 12),
+    this.department,
   });
+
+  /// Offer only the units of this department, as a department id. Null offers
+  /// them all.
+  final Object? department;
 
   /// A unit id as text. Empty is [placeholder], which the server reads as no
   /// unit at all — the organisation's own store on a write, everywhere at once
@@ -2282,8 +2287,21 @@ class UnitFieldState extends State<UnitField> {
   @override
   void didChangeDependencies() {
     super.didChangeDependencies();
-    _units ??= ApiScope.of(context).list('/units/');
+    _units ??= ApiScope.of(context).list('/units/', _query());
   }
+
+  @override
+  void didUpdateWidget(UnitField oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.department != widget.department) {
+      _units = ApiScope.of(context).list('/units/', _query());
+    }
+  }
+
+  Map<String, dynamic> _query([String query = '']) => {
+    if (widget.department != null) 'department': '${widget.department}',
+    if (query.isNotEmpty) 'search': query,
+  };
 
   List<DropdownMenuEntry<String?>> _entries(List<Map<String, dynamic>> rows) => [
     DropdownMenuEntry(value: '', label: widget.placeholder),
@@ -2310,7 +2328,7 @@ class UnitFieldState extends State<UnitField> {
             value: widget.value,
             entries: _entries(rows),
             search: (query) async =>
-                _entries(await api.list('/units/', {if (query.isNotEmpty) 'search': query})),
+                _entries(await api.list('/units/', _query(query))),
             onSelected: (value) => widget.onSelected(value ?? ''),
           ),
         );

@@ -38,6 +38,9 @@ void main() {
         if (request.url.path.endsWith('/units/')) {
           return http.Response(jsonEncode(_units), 200);
         }
+        if (request.url.path.endsWith('/departments/')) {
+          return http.Response(jsonEncode([{'id': 1, 'name': 'LABORATORY'}]), 200);
+        }
         queries.add(request.url.query);
         return http.Response(jsonEncode(_rows), 200);
       }),

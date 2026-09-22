@@ -21,6 +21,10 @@ class _UnitItemsScreenState extends State<UnitItemsScreen> {
 
   /// Which shelf is listed, as a unit id. Empty is every shelf.
   String _unit = '';
+
+  /// Which department's shelves, when no one unit is picked. Null is all.
+  Object? _department;
+  Future<List<Map<String, dynamic>>>? _departments;
   bool _started = false;
 
   @override
@@ -30,7 +34,13 @@ class _UnitItemsScreenState extends State<UnitItemsScreen> {
     _started = true;
     // Somebody placed on a unit opens on their own shelf.
     _unit = '${ApiScope.of(context).unitId ?? ''}';
+    _departments = ApiScope.of(context).list('/departments/');
   }
+
+  List<DropdownMenuEntry<Object?>> _departmentEntries(List<Map<String, dynamic>> rows) => [
+    const DropdownMenuEntry(value: null, label: 'Every department'),
+    for (final row in rows) DropdownMenuEntry(value: row['id'], label: '${row['name']}'),
+  ];
 
   @override
   void dispose() {
@@ -81,15 +91,52 @@ class _UnitItemsScreenState extends State<UnitItemsScreen> {
             hintText: 'Search items',
           ),
           Bounded(
-            child: UnitField(
-              value: _unit,
-              label: 'Unit',
-              placeholder: 'Every unit',
+            child: Padding(
               padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
-              onSelected: (value) {
-                setState(() => _unit = value);
-                _controller.reload();
-              },
+              child: Row(
+                children: [
+                  Expanded(
+                    child: FutureBuilder<List<Map<String, dynamic>>>(
+                      future: _departments,
+                      builder: (context, snapshot) {
+                        final rows = snapshot.data ?? const <Map<String, dynamic>>[];
+                        // One department is no choice at all.
+                        if (rows.length < 2) return const SizedBox.shrink();
+                        return PickerField<Object?>(
+                          label: 'Department',
+                          value: _department,
+                          entries: _departmentEntries(rows),
+                          search: (query) async => _departmentEntries(
+                            await api.list('/departments/', {'search': query}),
+                          ),
+                          onSelected: (value) {
+                            // A unit of the old department is no longer on offer.
+                            setState(() {
+                              _department = value;
+                              _unit = '';
+                            });
+                            _controller.reload();
+                          },
+                        );
+                      },
+                    ),
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: UnitField(
+                      value: _unit,
+                      label: 'Unit',
+                      placeholder: 'Every unit',
+                      department: _department,
+                      padding: EdgeInsets.zero,
+                      onSelected: (value) {
+                        setState(() => _unit = value);
+                        _controller.reload();
+                      },
+                    ),
+                  ),
+                ],
+              ),
             ),
           ),
           Expanded(
@@ -97,7 +144,8 @@ class _UnitItemsScreenState extends State<UnitItemsScreen> {
               controller: _controller,
               load: () => api.list('/unit-items/', {
                 'search': _search.text,
-                if (_unit.isNotEmpty) 'unit': _unit,
+                if (_unit.isNotEmpty) 'unit': _unit
+                else if (_department != null) 'department': '$_department',
               }),
               builder: (context, rows, reload) {
                 if (rows.isEmpty) return const EmptyState('Nothing on this shelf yet.');
