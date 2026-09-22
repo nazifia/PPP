@@ -170,14 +170,35 @@ class _UnitItemsScreenState extends State<UnitItemsScreen> {
               }),
               builder: (context, rows, reload) {
                 if (rows.isEmpty) return const EmptyState('Nothing on this shelf yet.');
+                final low = rows.where((row) => row['is_low_stock'] == true).length;
+                final scheme = Theme.of(context).colorScheme;
                 return ListView(
                   children: [
+                    // The alarm sits above the list, not only on the rows it
+                    // is about, so it is seen before anyone scrolls.
+                    if (low > 0)
+                      Material(
+                        color: scheme.errorContainer,
+                        child: ListTile(
+                          leading: Icon(Icons.warning_amber_rounded, color: scheme.onErrorContainer),
+                          title: Text(
+                            '$low ${low == 1 ? 'item is' : 'items are'} below reorder level',
+                            style: TextStyle(
+                              color: scheme.onErrorContainer,
+                              fontWeight: FontWeight.w600,
+                            ),
+                          ),
+                        ),
+                      ),
                     for (final row in rows)
                       ListTile(
                         leading: Icon(
-                          row['is_active'] == true
-                              ? Icons.medication_outlined
-                              : Icons.block_outlined,
+                          row['is_active'] != true
+                              ? Icons.block_outlined
+                              : row['is_low_stock'] == true
+                                  ? Icons.warning_amber_rounded
+                                  : Icons.medication_outlined,
+                          color: row['is_low_stock'] == true ? scheme.error : null,
                         ),
                         title: Text(
                           [

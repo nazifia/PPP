@@ -93,6 +93,8 @@ const statusColors = <String, Color>{
   'PARTIAL': Colors.teal,
   'AVL': Colors.green,
   'RV': Colors.blue,
+  // A shelf below its reorder level: an alarm, not a state.
+  'LOW': Colors.red,
 };
 
 /// The same statuses as a shape, so the two that matter most — approved green
@@ -124,6 +126,7 @@ const statusIcons = <String, IconData>{
   'PARTIAL': Icons.incomplete_circle,
   'AVL': Icons.inventory_2_outlined,
   'RV': Icons.production_quantity_limits,
+  'LOW': Icons.warning_amber_rounded,
 };
 
 IconData statusIcon(String status) => statusIcons[status] ?? Icons.circle_outlined;
