@@ -1,3 +1,6 @@
+import 'dart:convert';
+
+import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 
 import '../api.dart';
@@ -62,6 +65,14 @@ class _UnitItemsScreenState extends State<UnitItemsScreen> {
     if (saved == true) _controller.reload();
   }
 
+  Future<void> _import() async {
+    final done = await showDialog<bool>(
+      context: context,
+      builder: (_) => _ImportDialog(unit: _unit),
+    );
+    if (done == true) _controller.reload();
+  }
+
   Future<void> _delete(Api api, Map<String, dynamic> item) async {
     final ok = await confirm(
       context, 'Remove item', 'Take ${item['name']} off ${item['unit_name']}?',
@@ -79,7 +90,17 @@ class _UnitItemsScreenState extends State<UnitItemsScreen> {
   Widget build(BuildContext context) {
     final api = ApiScope.of(context);
     return Scaffold(
-      appBar: AppBar(title: const Text('Unit items')),
+      appBar: AppBar(
+        title: const Text('Unit items'),
+        actions: [
+          if (api.isHospital && (api.isAdmin || api.unitId != null))
+            IconButton(
+              icon: const Icon(Icons.upload_file_outlined),
+              tooltip: 'Import from CSV',
+              onPressed: _import,
+            ),
+        ],
+      ),
       floatingActionButton: api.isHospital && (api.isAdmin || api.unitId != null)
           ? FloatingActionButton(onPressed: () => _edit(null), child: const Icon(Icons.add))
           : null,
@@ -404,6 +425,176 @@ class _ItemDialogState extends State<_ItemDialog> {
         FilledButton(
           onPressed: _busy ? null : _save,
           child: Text(_busy ? 'Saving...' : 'Save'),
+        ),
+      ],
+    );
+  }
+}
+
+/// The columns an import file may carry, in the order the template shows them.
+/// Only `name` is required; the rest are sent as given and the server decides.
+const importColumns = ['name', 'strength', 'brand', 'qty', 'reorder_level', 'expiry_date', 'note'];
+
+/// Turns pasted or picked CSV text into rows ready for `/unit-items/`.
+///
+/// The first line is a header naming the columns, in any order, so a sheet
+/// exported with extra columns still loads. Blank lines are skipped.
+///
+/// ponytail: split on commas and tabs, no quoted fields — a name with a comma
+/// in it needs a proper CSV parser, add one when a sheet turns up with one.
+List<Map<String, dynamic>> parseImport(String text) {
+  final lines = const LineSplitter().convert(text).where((line) => line.trim().isNotEmpty).toList();
+  if (lines.isEmpty) return [];
+  List<String> cells(String line) =>
+      line.split(RegExp(r'[,\t]')).map((cell) => cell.trim()).toList();
+  final header = cells(lines.first).map((cell) => cell.toLowerCase().replaceAll(' ', '_')).toList();
+  if (!header.contains('name')) {
+    throw const FormatException('The first line must name the columns and include "name".');
+  }
+  return [
+    for (final line in lines.skip(1))
+      {
+        for (final (index, column) in header.indexed)
+          if (importColumns.contains(column) &&
+              index < cells(line).length &&
+              cells(line)[index].isNotEmpty)
+            column: column == 'qty' || column == 'reorder_level'
+                ? parseQty(cells(line)[index])
+                : cells(line)[index],
+      },
+  ];
+}
+
+/// Loads many items onto one shelf at once, from a CSV pasted or picked.
+/// Each row is its own request, so one bad line fails alone and says why.
+class _ImportDialog extends StatefulWidget {
+  const _ImportDialog({required this.unit});
+
+  /// The shelf the list was showing, which the import starts on.
+  final String unit;
+
+  @override
+  State<_ImportDialog> createState() => _ImportDialogState();
+}
+
+class _ImportDialogState extends State<_ImportDialog> {
+  final _text = TextEditingController();
+  late String _unit = widget.unit;
+  bool _busy = false;
+  int _done = 0;
+  int _total = 0;
+  final _failures = <String>[];
+
+  @override
+  void dispose() {
+    _text.dispose();
+    super.dispose();
+  }
+
+  Future<void> _pickFile() async {
+    final picked = await FilePicker.pickFiles(
+      type: FileType.custom,
+      allowedExtensions: const ['csv', 'txt', 'tsv'],
+      withData: true,
+    );
+    final file = (picked?.files.isEmpty ?? true) ? null : picked!.files.first;
+    if (file?.bytes == null) return;
+    setState(() => _text.text = utf8.decode(file!.bytes!, allowMalformed: true));
+  }
+
+  Future<void> _run() async {
+    if (_unit.isEmpty) return showError(context, 'Pick the unit first.');
+    final List<Map<String, dynamic>> rows;
+    try {
+      rows = parseImport(_text.text);
+    } on FormatException catch (error) {
+      return showError(context, error.message);
+    }
+    if (rows.isEmpty) return showError(context, 'Nothing to import.');
+    final api = ApiScope.of(context);
+    setState(() {
+      _busy = true;
+      _done = 0;
+      _total = rows.length;
+      _failures.clear();
+    });
+    for (final (index, row) in rows.indexed) {
+      try {
+        await api.post('/unit-items/', {...row, 'unit': int.parse(_unit)});
+      } catch (error) {
+        _failures.add('Line ${index + 2} (${row['name'] ?? '?'}): $error');
+      }
+      if (mounted) setState(() => _done = index + 1);
+    }
+    if (!mounted) return;
+    setState(() => _busy = false);
+    if (_failures.isEmpty) {
+      showDone(context, 'Imported $_total items.');
+      Navigator.pop(context, true);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Text('Import items'),
+      content: SizedBox(
+        width: dialogWidth(context, 480),
+        child: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              UnitField(
+                value: _unit,
+                label: 'Unit',
+                placeholder: 'Pick a unit',
+                padding: EdgeInsets.zero,
+                onSelected: (value) => setState(() => _unit = value),
+              ),
+              const SizedBox(height: 12),
+              Text(
+                'First line names the columns: ${importColumns.join(', ')}. '
+                'Only name is required. Dates as YYYY-MM-DD.',
+                style: Theme.of(context).textTheme.bodySmall,
+              ),
+              const SizedBox(height: 8),
+              TextField(
+                controller: _text,
+                maxLines: 8,
+                enabled: !_busy,
+                style: const TextStyle(fontFamily: 'monospace', fontSize: 13),
+                decoration: const InputDecoration(
+                  labelText: 'CSV',
+                  hintText: 'name,strength,qty\nParacetamol,500mg,100',
+                  alignLabelWithHint: true,
+                ),
+              ),
+              TextButton.icon(
+                onPressed: _busy ? null : _pickFile,
+                icon: const Icon(Icons.folder_open_outlined),
+                label: const Text('Pick a file'),
+              ),
+              if (_total > 0) ...[
+                LinearProgressIndicator(value: _done / _total),
+                const SizedBox(height: 4),
+                Text('$_done of $_total · ${_failures.length} failed'),
+              ],
+              for (final failure in _failures)
+                Text(failure, style: TextStyle(color: Theme.of(context).colorScheme.error)),
+            ],
+          ),
+        ),
+      ),
+      actions: [
+        TextButton(
+          // Some rows may have landed before one failed; the list reloads then.
+          onPressed: _busy ? null : () => Navigator.pop(context, _done > _failures.length),
+          child: Text(_failures.isEmpty ? 'Cancel' : 'Close'),
+        ),
+        FilledButton(
+          onPressed: _busy ? null : _run,
+          child: Text(_busy ? 'Importing...' : 'Import'),
         ),
       ],
     );
