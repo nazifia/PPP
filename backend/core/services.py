@@ -664,6 +664,17 @@ def request_transfer(user, from_unit, to_unit, items, note=''):
     return transfer
 
 
+def _lock_transfer(transfer):
+    """Re-read the row under a lock, so two answers to one transfer take turns.
+
+    Every step first asks what state the transfer is in and then writes the
+    next one. Without this, two people pressing "hand over" at the same moment
+    both read APPROVED and the shelf is emptied twice. The invoice takes the
+    same lock for the same reason.
+    """
+    return Transfer.objects.select_for_update().get(pk=transfer.pk)
+
+
 def _transfer_lines(transfer, items, field):
     """The transfer's lines, and the quantity named against each of them.
 
@@ -692,6 +703,7 @@ def approve_transfer(transfer, user, items, note=''):
     """
     require_owner(user, transfer.hospital, 'Not your transfer.')
     require_hospital(user)
+    transfer = _lock_transfer(transfer)
     if transfer.status != TransferStatus.REQUESTED:
         raise ValidationError('This transfer has already been decided.')
     if transfer.from_unit is None or transfer.to_unit is None:
@@ -735,6 +747,7 @@ def issue_transfer(transfer, user, items, note=''):
     """
     require_owner(user, transfer.hospital, 'Not your transfer.')
     require_hospital(user)
+    transfer = _lock_transfer(transfer)
     if transfer.status != TransferStatus.APPROVED:
         raise ValidationError(
             'Only a transfer the holding unit has agreed to can be issued.'
@@ -744,7 +757,10 @@ def issue_transfer(transfer, user, items, note=''):
     require_unit_member(user, transfer.from_unit, 'hand its stock over')
 
     issued_total = ZERO
-    for line, qty in _transfer_lines(transfer, items, 'qty'):
+    # Locked in one order across every transfer, so two issues that share two
+    # items cannot each wait on the other's lock.
+    lines = sorted(_transfer_lines(transfer, items, 'qty'), key=lambda pair: pair[0].product_id)
+    for line, qty in lines:
         if qty < 0:
             raise ValidationError('Issued quantity cannot be negative.')
         if qty > line.qty_approved:
@@ -806,6 +822,7 @@ def receive_transfer(transfer, user, items, note=''):
     """
     require_owner(user, transfer.hospital, 'Not your transfer.')
     require_hospital(user)
+    transfer = _lock_transfer(transfer)
     if transfer.status != TransferStatus.ISSUED:
         raise ValidationError('Only stock that has been issued can be confirmed received.')
     if transfer.to_unit is None:
@@ -871,6 +888,7 @@ def reject_transfer(transfer, user, reason=''):
     """The holding unit says no. Nothing moves."""
     require_owner(user, transfer.hospital, 'Not your transfer.')
     require_hospital(user)
+    transfer = _lock_transfer(transfer)
     if transfer.status != TransferStatus.REQUESTED:
         raise ValidationError('This transfer has already been decided.')
     require_unit_member(user, transfer.from_unit, 'refuse a request for its stock')
@@ -900,6 +918,7 @@ def cancel_transfer(transfer, user, reason=''):
     """
     require_owner(user, transfer.hospital, 'Not your transfer.')
     require_hospital(user)
+    transfer = _lock_transfer(transfer)
     if transfer.status not in TRANSFER_OPEN_STATUSES:
         raise ValidationError('A transfer can only be withdrawn before it is issued.')
     require_unit_member(user, transfer.to_unit, 'withdraw its request')

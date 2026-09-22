@@ -13,21 +13,29 @@ import '../ui.dart';
 
 /// The units of the caller's own hospital. [department] narrows it to the one
 /// department a transfer may cross, which is the only pairing the server takes.
-Future<List<Map<String, dynamic>>> _units(Api api, {Object? department, String query = ''}) =>
-    api.list('/units/', {
-      if (department != null) 'department': '$department',
-      if (query.isNotEmpty) 'search': query,
-    });
+Future<List<Map<String, dynamic>>> _units(Api api, {Object? department, String query = ''}) async {
+  // Every page, not the first 25: a big hospital keeps more units than that,
+  // and a retired one is refused by the server, so it is not offered.
+  final rows = await api.listAll('/units/', {
+    if (department != null) 'department': '$department',
+    if (query.isNotEmpty) 'search': query,
+  });
+  return [
+    for (final row in rows)
+      if (row['is_active'] != false) row,
+  ];
+}
 
 List<DropdownMenuEntry<int?>> _unitEntries(List<Map<String, dynamic>> rows) => [
   for (final row in rows) DropdownMenuEntry(value: row['id'] as int, label: '${row['full_name']}'),
 ];
 
-/// What one unit's shelf holds, item by item. The same balances the ledger
-/// shows, asked for one unit — which is what a transfer may be issued against.
-Future<List<Map<String, dynamic>>> _held(Api api, Object unit, {String query = ''}) async {
+/// What a shelf holds, item by item. The same balances the ledger shows,
+/// asked for one [unit] — which is what a transfer may be issued against — or,
+/// with no unit named, for everything the hospital holds anywhere.
+Future<List<Map<String, dynamic>>> _held(Api api, {Object? unit, String query = ''}) async {
   final rows = await api.list('/stock-movements/balances/', {
-    'unit': '$unit',
+    if (unit != null) 'unit': '$unit',
     if (query.isNotEmpty) 'search': query,
   });
   return [
@@ -39,7 +47,7 @@ Future<List<Map<String, dynamic>>> _held(Api api, Object unit, {String query = '
 /// Product id to what the holding unit has of it, for the screens that decide a
 /// quantity: agreeing to lend what is not there only postpones the refusal.
 Future<Map<Object, double>> _heldByProduct(Api api, Object unit) async => {
-  for (final row in await _held(api, unit)) row['product'] as Object: qty(row['balance']),
+  for (final row in await _held(api, unit: unit)) row['product'] as Object: qty(row['balance']),
 };
 
 const _transferFilters = {
@@ -668,11 +676,11 @@ class _AskDialogState extends State<_AskDialog> {
                   ),
                   const SizedBox(height: 12),
                   if (_fromUnit != null)
-                    FutureBuilder<List<Map<String, dynamic>>>(
+                    FutureBuilder<(List<Map<String, dynamic>>, Map<Object, double>)>(
                       // Keyed on the unit, so picking another one asks again
                       // instead of offering the last one's shelf.
                       key: ValueKey(_fromUnit),
-                      future: _held(api, _fromUnit!),
+                      future: _offer(api),
                       builder: (context, stock) {
                         if (stock.connectionState != ConnectionState.done) {
                           return const Padding(
@@ -680,18 +688,19 @@ class _AskDialogState extends State<_AskDialog> {
                             child: Spinner(),
                           );
                         }
-                        final rows = stock.data ?? const <Map<String, dynamic>>[];
+                        final (rows, shelf) =
+                            stock.data ?? (const <Map<String, dynamic>>[], const <Object, double>{});
                         if (rows.isEmpty) {
-                          return const Text('That unit holds nothing at the moment.');
+                          return const Text('This hospital holds nothing at the moment.');
                         }
                         return Column(
                           children: [
                             PickerField<Object?>(
                               label: 'Item',
                               value: _product,
-                              entries: _stockEntries(rows),
+                              entries: _stockEntries(rows, shelf),
                               search: (query) async =>
-                                  _stockEntries(await _held(api, _fromUnit!, query: query)),
+                                  _stockEntries(await _held(api, query: query), shelf),
                               onSelected: (value) => setState(() {
                                 _product = value;
                                 _productLabel =
@@ -758,11 +767,22 @@ class _AskDialogState extends State<_AskDialog> {
     );
   }
 
-  List<DropdownMenuEntry<Object?>> _stockEntries(List<Map<String, dynamic>> rows) => [
+  /// Everything the hospital holds anywhere, and what the asked unit has of
+  /// each. The whole hospital, because an item missing from that one shelf is
+  /// exactly what a unit asks about, and the holding unit answers with what it
+  /// finds there — the server checks the shelf when it is handed over.
+  Future<(List<Map<String, dynamic>>, Map<Object, double>)> _offer(Api api) async =>
+      (await _held(api), await _heldByProduct(api, _fromUnit!));
+
+  List<DropdownMenuEntry<Object?>> _stockEntries(
+    List<Map<String, dynamic>> rows,
+    Map<Object, double> shelf,
+  ) => [
     for (final row in rows)
       DropdownMenuEntry<Object?>(
         value: row['product'],
-        label: '${row['product_name']} · ${qtyText(row['balance'])} held',
+        label: '${row['product_name']} · '
+            '${shelf[row['product']] == null ? 'none' : qtyText(shelf[row['product']])} on that shelf',
       ),
   ];
 }
