@@ -111,6 +111,16 @@ class MoreScreen extends StatelessWidget {
               subtitle: const Text('Every item in and out'),
               onTap: () => open(const StockLedgerScreen()),
             ),
+            // The hospital's own shelf: what landed off a request that named no
+            // unit, and where a ward sends back what it no longer needs. The
+            // same ledger, opened on the store's balances.
+            if (api.canActAsHospital)
+              ListTile(
+                leading: const Icon(Icons.warehouse_outlined),
+                title: const Text('Store'),
+                subtitle: const Text('What the hospital holds centrally, and issue it to units'),
+                onTap: () => open(const StockLedgerScreen(unit: 'store', showBalances: true)),
+              ),
             // Between two units of one department, so it only exists where an
             // organisation is divided that far — which is a hospital.
             if (api.canActAsHospital)
@@ -1372,7 +1382,7 @@ class _RaiseCreditDialogState extends State<_RaiseCreditDialog> {
     super.initState();
     // What is left after earlier notes, from the server: working it out here is
     // how the two come to disagree.
-    _lines = ApiScope.of(context)
+    _lines = ApiScope.read(context)
         .get('/invoices/${widget.invoice['id']}/creditable/')
         .then((rows) => (rows as List).cast<Map<String, dynamic>>());
   }
@@ -1885,11 +1895,22 @@ const stockMovementKinds = {
 };
 
 class StockLedgerScreen extends StatefulWidget {
-  const StockLedgerScreen({super.key, this.product, this.productName});
+  const StockLedgerScreen({
+    super.key,
+    this.product,
+    this.productName,
+    this.unit = '',
+    this.showBalances = false,
+  });
 
   /// Show one item's movements instead of the whole ledger.
   final Object? product;
   final String? productName;
+
+  /// Open on one shelf ('store' or a unit id) and on totals rather than
+  /// movements. Both stay changeable from the screen.
+  final String unit;
+  final bool showBalances;
 
   @override
   State<StockLedgerScreen> createState() => _StockLedgerScreenState();
@@ -1903,10 +1924,10 @@ class _StockLedgerScreenState extends State<StockLedgerScreen> {
 
   /// Whose shelf to read: one unit's, the organisation's own store ('store'),
   /// or the whole organisation when it is empty.
-  String _unit = '';
+  late String _unit = widget.unit;
 
   /// Totals per item instead of the movements themselves.
-  bool _showBalances = false;
+  late bool _showBalances = widget.showBalances;
 
   /// The ledger only grows, so it outruns one page. The first page comes from
   /// the [Loader]; every page after it is appended here.
@@ -2049,6 +2070,14 @@ class _StockLedgerScreenState extends State<StockLedgerScreen> {
     if (recorded == true) _controller.reload();
   }
 
+  Future<void> _move() async {
+    final recorded = await showDialog<bool>(
+      context: context,
+      builder: (_) => _MoveDialog(product: widget.product),
+    );
+    if (recorded == true) _controller.reload();
+  }
+
   Future<void> _pickRange() async {
     if (_range != null) {
       setState(() => _range = null);
@@ -2077,7 +2106,7 @@ class _StockLedgerScreenState extends State<StockLedgerScreen> {
             )
           : null,
       appBar: AppBar(
-        title: Text(widget.productName ?? 'Stock ledger'),
+        title: Text(widget.productName ?? (widget.unit == 'store' ? 'Store' : 'Stock ledger')),
         actions: [
           // Dispensing means a ward used the goods; everything else that takes
           // something off the shelf comes through here, and it answers to an
@@ -2088,6 +2117,14 @@ class _StockLedgerScreenState extends State<StockLedgerScreen> {
               icon: const Icon(Icons.edit_note),
               tooltip: 'Adjust stock',
               onPressed: _adjust,
+            ),
+          // The store issuing to a ward, or a ward sending stock back: the one
+          // road between the store's shelf and a unit's.
+          if (ApiScope.of(context).canActAsHospital)
+            IconButton(
+              icon: const Icon(Icons.move_down),
+              tooltip: 'Move stock',
+              onPressed: _move,
             ),
           // The same filters the list is showing, so the sheet covers what is
           // on screen. Balances are a different query and print nothing yet.
@@ -2364,8 +2401,8 @@ class _DispenseDialogState extends State<_DispenseDialog> {
   void initState() {
     super.initState();
     _product = widget.product;
-    _unit = '${ApiScope.of(context).unitId ?? ''}';
-    _held = _balances(ApiScope.of(context), inStock: true, unit: _shelf);
+    _unit = '${ApiScope.read(context).unitId ?? ''}';
+    _held = _balances(ApiScope.read(context), inStock: true, unit: _shelf);
   }
 
   /// What to ask the balances for: one unit, or the store on its own.
@@ -2512,7 +2549,7 @@ class _AdjustDialogState extends State<_AdjustDialog> {
     // down to nothing: a miscount is corrected upwards as often as down. An
     // item with no history at all is one this hospital never received, and the
     // server refuses it.
-    _held = _balances(ApiScope.of(context), unit: 'store');
+    _held = _balances(ApiScope.read(context), unit: 'store');
   }
 
   void _pickUnit(String unit) => setState(() {
@@ -2625,6 +2662,174 @@ class _AdjustDialogState extends State<_AdjustDialog> {
         FilledButton(
           onPressed: _busy ? null : _submit,
           child: Text(_busy ? 'Saving...' : 'Adjust'),
+        ),
+      ],
+    );
+  }
+}
+
+/// Moves stock between the organisation's store and one unit's shelf. The
+/// picker offers what the giving side holds, so nothing can be moved from a
+/// shelf that has not got it. Unit to unit is a transfer, which takes turns.
+class _MoveDialog extends StatefulWidget {
+  const _MoveDialog({this.product});
+
+  final Object? product;
+
+  @override
+  State<_MoveDialog> createState() => _MoveDialogState();
+}
+
+class _MoveDialogState extends State<_MoveDialog> {
+  final _qty = TextEditingController();
+  final _note = TextEditingController();
+  late Future<List<Map<String, dynamic>>> _held;
+  Object? _product;
+
+  /// The unit on the other end of the move, as a unit id. Defaults to the
+  /// account's own unit, which is the shelf it is standing at.
+  String _unit = '';
+
+  /// True when the unit gives and the store takes.
+  bool _toStore = false;
+  bool _busy = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _product = widget.product;
+    _unit = '${ApiScope.read(context).unitId ?? ''}';
+    _held = _balances(ApiScope.read(context), inStock: true, unit: _giving);
+  }
+
+  /// What to ask the balances for: the shelf the goods leave.
+  String get _giving => _toStore && _unit.isNotEmpty ? _unit : 'store';
+
+  void _reload() => setState(() {
+    _product = null;
+    _held = _balances(ApiScope.of(context), inStock: true, unit: _giving);
+  });
+
+  @override
+  void dispose() {
+    _qty.dispose();
+    _note.dispose();
+    super.dispose();
+  }
+
+  Future<void> _submit() async {
+    final moved = parseQty(_qty.text);
+    if (_unit.isEmpty) {
+      showError(context, 'Pick the unit the stock moves to or from.');
+      return;
+    }
+    if (_product == null || moved == null || moved < halfUnit) {
+      showError(context, 'Pick an item and a quantity. $badQtyMessage');
+      return;
+    }
+    final api = ApiScope.of(context);
+    final org = await orgField(context, api, kind: 'HOSPITAL');
+    if (org == null || !mounted) return;
+    setState(() => _busy = true);
+    try {
+      await api.post('/stock-movements/move/', {
+        'product': _product,
+        'qty': moved,
+        'note': _note.text,
+        if (_toStore) 'from_unit': int.parse(_unit) else 'to_unit': int.parse(_unit),
+        ...org,
+      });
+      if (mounted) Navigator.pop(context, true);
+    } catch (error) {
+      if (mounted) showError(context, error);
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Text('Move stock'),
+      content: SizedBox(
+        width: dialogWidth(context, 380),
+        child: FutureBuilder<List<Map<String, dynamic>>>(
+          future: _held,
+          builder: (context, snapshot) {
+            if (snapshot.connectionState != ConnectionState.done) {
+              return const Spinner(height: 80);
+            }
+            if (snapshot.hasError) return Text('${snapshot.error}');
+            final stocked = snapshot.data!;
+            return SingleChildScrollView(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  SegmentedButton<bool>(
+                    segments: const [
+                      ButtonSegment(value: false, label: Text('Store to unit')),
+                      ButtonSegment(value: true, label: Text('Unit to store')),
+                    ],
+                    selected: {_toStore},
+                    onSelectionChanged: (picked) {
+                      _toStore = picked.first;
+                      _reload();
+                    },
+                  ),
+                  UnitField(
+                    label: 'Unit',
+                    placeholder: 'Pick a unit',
+                    value: _unit,
+                    onSelected: (unit) {
+                      _unit = unit;
+                      _reload();
+                    },
+                  ),
+                  const SizedBox(height: 12),
+                  if (stocked.isEmpty)
+                    Text(
+                      _toStore
+                          ? 'Nothing on that shelf to send back.'
+                          : 'Nothing in the store to issue.',
+                    )
+                  else
+                    PickerField<Object?>(
+                      label: 'Item',
+                      value: stocked.any((row) => row['product'] == _product) ? _product : null,
+                      entries: _balanceEntries(stocked, 'held'),
+                      search: (query) async => _balanceEntries(
+                        await _balances(
+                          ApiScope.of(context),
+                          query: query,
+                          inStock: true,
+                          unit: _giving,
+                        ),
+                        'held',
+                      ),
+                      onSelected: (value) => setState(() => _product = value),
+                    ),
+                  const SizedBox(height: 12),
+                  TextField(
+                    controller: _qty,
+                    keyboardType: qtyKeyboard(),
+                    decoration: const InputDecoration(labelText: 'Quantity'),
+                  ),
+                  const SizedBox(height: 12),
+                  TextField(
+                    controller: _note,
+                    decoration: const InputDecoration(labelText: 'Note', hintText: 'Why'),
+                  ),
+                ],
+              ),
+            );
+          },
+        ),
+      ),
+      actions: [
+        TextButton(onPressed: () => Navigator.pop(context), child: const Text('Cancel')),
+        FilledButton(
+          onPressed: _busy ? null : _submit,
+          child: Text(_busy ? 'Saving...' : 'Move'),
         ),
       ],
     );

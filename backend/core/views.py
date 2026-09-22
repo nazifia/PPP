@@ -78,6 +78,7 @@ from .serializers import (
     CreditNoteSerializer,
     DecideSerializer,
     DispenseSerializer,
+    MoveSerializer,
     DeliverySerializer,
     DepartmentSerializer,
     DispensingUnitSerializer,
@@ -1489,6 +1490,14 @@ class StockMovementViewSet(PrintListMixin, viewsets.ReadOnlyModelViewSet):
         serializer = AdjustSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         movement = services.adjust(request.user, **serializer.validated_data)
+        return Response(StockMovementSerializer(movement).data, status=status.HTTP_201_CREATED)
+
+    @action(detail=False, methods=['post'])
+    def move(self, request):
+        """Stock changes shelf between the store and a unit. Unit to unit is a transfer."""
+        serializer = MoveSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        movement = services.move_stock(request.user, **serializer.validated_data)
         return Response(StockMovementSerializer(movement).data, status=status.HTTP_201_CREATED)
 
     @action(detail=False)

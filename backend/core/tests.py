@@ -3684,6 +3684,79 @@ class UnitTransferTests(APITestCase):
         self.assertIn('HAEMATOLOGY', ledger_text)
 
 
+    def move(self, qty, from_unit=None, to_unit=None):
+        return self.client.post('/api/stock-movements/move/', {
+            'product': self.product.id, 'qty': qty,
+            'from_unit': from_unit.id if from_unit else None,
+            'to_unit': to_unit.id if to_unit else None,
+        }, format='json')
+
+    def test_stock_moves_between_the_store_and_a_unit_and_back(self):
+        """The store issues to a ward; the ward sends back what it no longer needs."""
+        self.stock(None, 30)
+        self.login(self.holder)
+
+        issued = self.move(12, to_unit=self.haematology)
+        self.assertEqual(issued.status_code, 201, issued.data)
+        self.assertEqual(issued.data['kind'], 'TRANSFER')
+        self.assertEqual(self.balance(self.haematology), Decimal('12.0'))
+
+        returned = self.move(2, from_unit=self.haematology)
+        self.assertEqual(returned.status_code, 201, returned.data)
+        self.assertEqual(self.balance(self.haematology), Decimal('10.0'))
+
+        # The store's own shelf, and the building's total, both add up.
+        store = self.client.get('/api/stock-movements/balances/?unit=store').data
+        self.assertEqual(store[0]['balance'], Decimal('20.0'))
+        self.assertEqual(self.balance(), Decimal('30.0'))
+
+        # The store cannot issue what it does not hold: the rest is on a ward.
+        refused = self.move(25, to_unit=self.haematology)
+        self.assertEqual(refused.status_code, 400, refused.data)
+        self.assertIn('in the store', str(refused.data))
+
+    def test_what_the_ledger_puts_on_a_shelf_shows_on_the_unit_items_list(self):
+        """The ward sees one shelf: what it was sold beside what it was given."""
+        StockMovement.objects.filter(pk=self.stock(None, 10).pk).update(
+            batch_no='B-2', expiry_date='2027-09-30',
+        )
+        StockMovement.objects.filter(pk=self.stock(None, 20).pk).update(
+            batch_no='B-1', expiry_date='2027-03-31',
+        )
+        self.login(self.holder)
+        self.assertEqual(self.move(12, to_unit=self.haematology).status_code, 201)
+
+        rows = self.client.get(f'/api/unit-items/?unit={self.haematology.id}').data['results']
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]['name'], '10% Dextrose Water')
+        self.assertEqual(Decimal(str(rows[0]['qty'])), Decimal('12.0'))
+        self.assertEqual(rows[0]['dispensing_unit_name'], 'CARTON')
+        # The batch's date travels with the goods, soonest first.
+        self.assertEqual(rows[0]['expiry_date'], '2027-03-31')
+
+        # Sent back, and handed out: the count keeps up both ways.
+        self.assertEqual(self.move(2, from_unit=self.haematology).status_code, 201)
+        self.client.post('/api/stock-movements/dispense/', {
+            'product': self.product.id, 'qty': 3, 'unit': self.haematology.id,
+        }, format='json')
+        rows = self.client.get(f'/api/unit-items/?unit={self.haematology.id}').data['results']
+        self.assertEqual(Decimal(str(rows[0]['qty'])), Decimal('7.0'))
+
+    def test_a_move_names_exactly_one_unit_and_its_own_people_sign(self):
+        self.stock(None, 30)
+        self.login(self.admin)
+        # Neither side, or both: the first says nothing, the second is a transfer.
+        self.assertEqual(self.move(1).status_code, 400)
+        self.assertEqual(
+            self.move(1, from_unit=self.haematology, to_unit=self.chemistry).status_code, 400,
+        )
+        # The unit next door, and somebody nobody has placed, cannot fill a shelf
+        # that is not theirs.
+        for user in (self.asker, self.unplaced):
+            self.login(user)
+            self.assertEqual(self.move(1, to_unit=self.haematology).status_code, 403)
+
+
 class UnitItemTests(APITestCase):
     """A unit keeping count of its own shelf.
 

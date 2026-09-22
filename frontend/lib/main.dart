@@ -102,6 +102,11 @@ class ApiScope extends InheritedNotifier<Api> {
 
   static Api of(BuildContext context) =>
       context.dependOnInheritedWidgetOfExactType<ApiScope>()!.notifier!;
+
+  /// The session without subscribing to it: what `initState` may call, where
+  /// a dependency is not allowed yet and would not be wanted anyway.
+  static Api read(BuildContext context) =>
+      context.getInheritedWidgetOfExactType<ApiScope>()!.notifier!;
 }
 
 class PppApp extends StatelessWidget {

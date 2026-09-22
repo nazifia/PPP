@@ -902,6 +902,15 @@ class StockMovement(models.Model):
             models.Index(fields=['unit', 'product']),
         ]
 
+    def save(self, *args, **kwargs):
+        created = self.pk is None
+        super().save(*args, **kwargs)
+        # Whatever lands on or leaves a unit's shelf through the ledger is
+        # counted on the unit's own item list too, so the ward sees one shelf
+        # rather than two: what it was sold beside what it was given.
+        if created and self.unit_id:
+            UnitItem.count_movement(self)
+
 
 class TransferStatus(models.TextChoices):
     REQUESTED = 'REQUESTED', 'Requested, awaiting the holding unit'
@@ -1032,10 +1041,12 @@ class UnitItem(models.Model):
     only under the supplier's catalogue row. A ward also holds things nobody on
     the platform sold it — donations, the old stock it opened with, a reagent
     from another hospital — and this is where those are counted. Unit staff, or
-    an administrator, keep it. It is a count, not a ledger.
+    an administrator, keep it. It is a count, not a ledger: what the ledger
+    moves onto or off the unit's shelf is added here too (`count_movement`),
+    so the list reads as the whole shelf, but the ledger is the record of why.
 
-    ponytail: qty is edited in place, with the audit trail as the only history.
-    Give it movements when somebody needs to know *why* a figure changed.
+    ponytail: hand-kept rows are edited in place, with the audit trail as the
+    only history. Give them movements when somebody needs to know *why*.
     """
 
     unit = models.ForeignKey(Unit, on_delete=models.CASCADE, related_name='items')
@@ -1080,6 +1091,37 @@ class UnitItem(models.Model):
         return self.qty < (
             self.reorder_level if self.reorder_level is not None else DEFAULT_REORDER_LEVEL
         )
+
+    @classmethod
+    def count_movement(cls, movement):
+        """Add a ledger movement on a unit's shelf to that unit's own count.
+
+        The row is matched on what the catalogue calls the item — name, brand
+        and strength — and opened from the catalogue row if the unit had none.
+        The ledger stays the record of why; this is only the shelf count
+        keeping up with it. A hand-kept count corrected below what the ledger
+        then takes off it stops at zero rather than going negative: the count
+        was wrong, not the movement.
+        """
+        product = movement.product
+        item, _ = cls.objects.get_or_create(
+            unit_id=movement.unit_id, name=product.generic_name,
+            brand=product.brand, strength=product.strength,
+            defaults={
+                'formulation': product.formulation, 'dispensing_unit': product.unit,
+                'expiry_date': movement.expiry_date or None,
+            },
+        )
+        # Read back under the row lock so two movements in the same instant
+        # do not both add to the same stale figure.
+        item = cls.objects.select_for_update().get(pk=item.pk)
+        item.qty = max(item.qty + movement.qty, Decimal('0'))
+        if movement.expiry_date and (
+            item.expiry_date is None or movement.expiry_date < item.expiry_date
+        ):
+            item.expiry_date = movement.expiry_date
+        item.save(update_fields=['qty', 'expiry_date', 'updated_at'])
+        return item
 
 
 class AuditLog(models.Model):

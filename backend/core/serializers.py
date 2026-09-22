@@ -884,6 +884,20 @@ class AdjustSerializer(serializers.Serializer):
     )
 
 
+class MoveSerializer(serializers.Serializer):
+    """Stock between the store and one unit's shelf. Leave one side blank for the store."""
+
+    product = serializers.PrimaryKeyRelatedField(queryset=Product.objects.all())
+    qty = QuantityField(min_value=HALF_UNIT)
+    from_unit = serializers.PrimaryKeyRelatedField(
+        queryset=Unit.objects.all(), required=False, allow_null=True, default=None,
+    )
+    to_unit = serializers.PrimaryKeyRelatedField(
+        queryset=Unit.objects.all(), required=False, allow_null=True, default=None,
+    )
+    note = serializers.CharField(max_length=255, required=False, allow_blank=True, default='')
+
+
 class StockMovementSerializer(serializers.ModelSerializer):
     product_name = serializers.CharField(source='product.__str__', read_only=True)
     delivery_reference = serializers.CharField(source='delivery.reference', read_only=True)

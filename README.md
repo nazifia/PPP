@@ -68,7 +68,11 @@ the name); adding, editing or deleting a row takes the unit's own staff or an ad
 the same rule a transfer and a dispense answer to, and moving a row onto another unit's shelf
 needs the say-so of that unit too. A unit still listing items cannot be deleted, only retired.
 This is a count, not a ledger: the quantity is edited in place, and the audit trail is its
-only history.
+only history. What the stock ledger moves onto or off a unit's shelf — a delivery received
+against the unit's request, a store issue, a transfer, a dispense — is added to this count
+too, under the catalogue's name for the item, so the list reads as the whole shelf. The
+ledger stays the record of why; a hand-corrected count that the ledger then draws below
+zero stops at zero.
 
 An organisation administrator opens the accounts inside it, edits any detail of one —
 name, phone, email, job title and role, between `ADMIN` and `STAFF` — resets a forgotten
@@ -141,6 +145,15 @@ DRAFT ──submit──▶ SUBMITTED ──decide──┬─▶ APPROVED ─�
    matched the book — is `POST /stock-movements/adjust/`: a signed quantity and a reason,
    from a hospital administrator. Without it the ledger drifts away from the shelf and
    never comes back. The supplier's half of this is `POST /products/{id}/restock/`.
+9. **Move.** Accepted goods land where the request pointed: on a unit's shelf if it named
+   one, in the hospital's own store otherwise. `POST /stock-movements/move/` is the road
+   between the two afterwards — the store issuing to a ward (`to_unit`), or a ward sending
+   back what it no longer needs (`from_unit`). One side names a unit, the other is blank for
+   the store. Nobody agrees first: the store is everybody's, and the unit's own staff or an
+   administrator sign for its shelf whichever way the goods go. The ledger writes it as a
+   `TRANSFER` pair, so the hospital's total never moves. The goods carry the soonest batch
+   and expiry date ever received on the shelf they leave, so the receiving unit's count is
+   not blind to it. Unit to unit is a transfer, which takes turns, and is refused here.
 
 On the company's side the same rule holds from the item's first day: a catalogue item added
 with `stock_qty` on it opens its ledger with that figure, and after that `restock/` is the
@@ -380,7 +393,7 @@ Everything lives under `/api/`. Authenticate with `Authorization: Token <key>`.
 | `/invoices/` | Invoices (`?status=`, `?overdue=true`), plus `pay/` (hospital records a payment) and `payments/` |
 | `/payments/` | Payment ledger (`?status=`, `?invoice=<id>`), plus `confirm/` and `reject/` (supplier), `withdraw/` (hospital, while still pending) and `receipt/` for the attached slip |
 | `/credits/` | Credit notes (`?status=`, `?invoice=<id>`), plus `confirm/` and `reject/` (supplier). Raised at `POST /invoices/{id}/credit/`; `GET /invoices/{id}/creditable/` says what is still open |
-| `/stock-movements/` | Stock ledger (`?product=<id>`, `?kind=`, `?from=`/`?to=` as inclusive dates), plus `balances/` for the per-item totals, `dispense/` (hospital records what it handed out), `adjust/` (hospital writes stock off) and `expiring/?days=90` (the shelf check) |
+| `/stock-movements/` | Stock ledger (`?product=<id>`, `?kind=`, `?from=`/`?to=` as inclusive dates), plus `balances/` for the per-item totals, `dispense/` (hospital records what it handed out), `adjust/` (hospital writes stock off), `move/` (between the store and one unit's shelf) and `expiring/?days=90` (the shelf check) |
 | `/audit-logs/` | Audit trail (administrators) |
 | `…/print/`, `…/print-link/` | The sheet as a PDF, and a signed ten-minute link to it for a browser — on a requisition, delivery, invoice or payment, and on the `/stock-movements/` and `/audit-logs/` lists (see Printing) |
 

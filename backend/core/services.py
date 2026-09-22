@@ -91,6 +91,23 @@ def stock_balance(organization, product, unit=None, store=False):
     return rows.aggregate(total=Sum('qty'))['total'] or ZERO
 
 
+def soonest_batch(organization, product, unit=None):
+    """The batch and expiry date to send on with goods leaving a shelf.
+
+    A dispense names no batch, so the ledger cannot say which batch is left;
+    the shelf check reads receipts and the pharmacist counts. Goods changing
+    shelf carry the soonest date of what has ever arrived on the one they
+    leave — the batch the pharmacist would hand over first — so the receiving
+    unit's count is not blind to it. ponytail: soonest received, not soonest
+    still there; per-batch balances need the batch named on the way out too.
+    """
+    rows = StockMovement.objects.filter(
+        organization=organization, product=product, expiry_date__isnull=False,
+        unit=unit, kind__in=[StockMovement.RECEIPT, StockMovement.TRANSFER], qty__gt=0,
+    ).order_by('expiry_date', 'id').values_list('batch_no', 'expiry_date').first()
+    return rows or ('', None)
+
+
 def require_own_unit(user, unit):
     """A unit of the caller's own hospital, still open for business."""
     if unit.department.organization_id != user.scope_org_id:
@@ -190,6 +207,60 @@ def adjust(user, product, qty, reason, unit=None):
         unit=str(unit) if unit else None,
     )
     return movement
+
+
+@transaction.atomic
+def move_stock(user, product, qty, from_unit=None, to_unit=None, note=''):
+    """Stock changes shelf between the hospital's own store and one of its units.
+
+    A verified delivery lands where the request pointed: on a unit's shelf if
+    it named one, in the store otherwise. This is the only road between the
+    two afterwards — the store issuing to a ward, or a ward sending what it no
+    longer needs back. Name one side as a unit and leave the other blank for
+    the store. Nobody has to agree first: the store belongs to everybody, and
+    the unit's own people (or an administrator) sign for its shelf, whichever
+    way the goods go. Unit to unit is a transfer, which takes turns, and is
+    refused here.
+    """
+    require_hospital(user)
+    if qty <= 0:
+        raise ValidationError('Moved quantity must be greater than zero.')
+    if from_unit is None and to_unit is None:
+        raise ValidationError('Name the unit the stock moves to or from.')
+    if from_unit is not None and to_unit is not None:
+        raise ValidationError('Between two units, raise a transfer instead.')
+    unit = from_unit or to_unit
+    require_own_unit(user, unit)
+    require_unit_member(user, unit, 'move stock on or off its shelf')
+
+    # The same lock a dispense takes, so two moves cannot both read one shelf full.
+    Product.objects.select_for_update().get(pk=product.pk)
+    held = stock_balance(user.scope_org, product, unit=from_unit, store=True)
+    if qty > held:
+        where = f' on {from_unit}' if from_unit is not None else ' in the store'
+        raise ValidationError(f'{product}: only {held} in stock{where}.')
+
+    # A pair, as a transfer writes: the hospital's own total is untouched.
+    label = f'Store issue to {to_unit}' if to_unit else f'Returned to store from {from_unit}'
+    if note:
+        label = f'{label}: {note.strip()}'
+    batch_no, expiry_date = soonest_batch(user.scope_org, product, unit=from_unit)
+    out = StockMovement.objects.create(
+        organization=user.scope_org, product=product, unit=from_unit,
+        kind=StockMovement.TRANSFER, qty=-qty, note=label[:255],
+    )
+    StockMovement.objects.create(
+        organization=user.scope_org, product=product, unit=to_unit,
+        kind=StockMovement.TRANSFER, qty=qty, note=label[:255],
+        batch_no=batch_no, expiry_date=expiry_date,
+    )
+    audit(
+        user, 'StockMovement', out.pk, 'MOVED',
+        product=str(product), qty=qty,
+        from_unit=str(from_unit) if from_unit else None,
+        to_unit=str(to_unit) if to_unit else None,
+    )
+    return out
 
 
 def require_partner(hospital, supplier):
@@ -783,10 +854,14 @@ def issue_transfer(transfer, user, items, note=''):
             kind=StockMovement.TRANSFER, qty=-qty,
             note=f'Transfer {transfer.reference} to {transfer.to_unit}'[:255],
         )
+        batch_no, expiry_date = soonest_batch(
+            transfer.hospital, line.product, unit=transfer.from_unit,
+        )
         StockMovement.objects.create(
             organization=transfer.hospital, product=line.product, unit=transfer.to_unit,
             kind=StockMovement.TRANSFER, qty=qty,
             note=f'Transfer {transfer.reference} from {transfer.from_unit}'[:255],
+            batch_no=batch_no, expiry_date=expiry_date,
         )
         issued_total += qty
 
